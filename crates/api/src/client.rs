@@ -1,22 +1,18 @@
 use std::collections::VecDeque;
 use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
-
 use crate::error::ApiError;
 use crate::types::{
     ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent, ContentBlockStopEvent,
-    InputContentBlock, InputMessage, MessageDelta, MessageDeltaEvent, MessageRequest,
-    MessageResponse, MessageStartEvent, MessageStopEvent, OutputContentBlock, StreamEvent,
-    ToolChoice, ToolDefinition, ToolResultContentBlock, Usage,
+    MessageRequest, MessageResponse, MessageStartEvent, MessageStopEvent, OutputContentBlock,
+    StreamEvent, Usage, MessageDelta, MessageDeltaEvent,
 };
 
-const DEFAULT_BASE_URL: &str = "http://127.0.0.1:11434";
+const DEFAULT_BASE_URL: &str = "http://127.0.0.1:8080";
 const DEFAULT_MAX_RETRIES: u32 = 2;
 const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_millis(200);
 const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(2);
-const CHAT_COMPLETIONS_PATH: &str = "/v1/chat/completions";
+const MESSAGES_PATH: &str = "/v1/messages";
 const TEXT_STREAM_CHUNK_BYTES: usize = 96;
 
 #[derive(Debug, Clone)]
@@ -29,6 +25,12 @@ pub struct LocalModelClient {
 }
 
 pub type AnthropicClient = LocalModelClient;
+
+impl Default for LocalModelClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl LocalModelClient {
     #[must_use]
@@ -69,10 +71,8 @@ impl LocalModelClient {
         &self,
         request: &MessageRequest,
     ) -> Result<MessageResponse, ApiError> {
-        let payload = build_local_chat_request(request);
-        let response = self.send_with_retry(&payload).await?;
-        let body = response.json::<LocalChatCompletionResponse>().await?;
-        completion_to_message_response(request, body)
+        let response = self.send_with_retry(request).await?;
+        response.json::<MessageResponse>().await.map_err(ApiError::from)
     }
 
     pub async fn stream_message(
@@ -85,7 +85,7 @@ impl LocalModelClient {
 
     async fn send_with_retry(
         &self,
-        request: &LocalChatCompletionRequest,
+        request: &MessageRequest,
     ) -> Result<reqwest::Response, ApiError> {
         let mut attempts = 0;
         let mut last_error: Option<ApiError> = None;
@@ -123,9 +123,9 @@ impl LocalModelClient {
 
     async fn send_raw_request(
         &self,
-        request: &LocalChatCompletionRequest,
+        request: &MessageRequest,
     ) -> Result<reqwest::Response, ApiError> {
-        let request_url = format!("{}{}", self.base_url.trim_end_matches('/'), CHAT_COMPLETIONS_PATH);
+        let request_url = format!("{}{}", self.base_url.trim_end_matches('/'), MESSAGES_PATH);
         self.http
             .post(request_url)
             .header("content-type", "application/json")
@@ -152,7 +152,6 @@ impl LocalModelClient {
 #[must_use]
 pub fn read_base_url() -> String {
     let raw = std::env::var("CLAW_LOCAL_BASE_URL")
-        .or_else(|_| std::env::var("OLLAMA_HOST"))
         .unwrap_or_else(|_| DEFAULT_BASE_URL.to_string());
     normalize_base_url(raw)
 }
@@ -279,297 +278,6 @@ fn split_text_chunks(text: &str) -> Vec<String> {
         chunks.push(current);
     }
     chunks
-}
-
-#[derive(Debug, Serialize)]
-struct LocalChatCompletionRequest {
-    model: String,
-    messages: Vec<LocalChatMessage>,
-    max_completion_tokens: u32,
-    stream: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tools: Option<Vec<LocalToolDefinition>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tool_choice: Option<Value>,
-}
-
-#[derive(Debug, Serialize)]
-struct LocalChatMessage {
-    role: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    content: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tool_call_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tool_calls: Option<Vec<LocalToolCall>>,
-}
-
-#[derive(Debug, Serialize)]
-struct LocalToolCall {
-    id: String,
-    #[serde(rename = "type")]
-    kind: String,
-    function: LocalToolCallFunction,
-}
-
-#[derive(Debug, Serialize)]
-struct LocalToolCallFunction {
-    name: String,
-    arguments: String,
-}
-
-#[derive(Debug, Serialize)]
-struct LocalToolDefinition {
-    #[serde(rename = "type")]
-    kind: String,
-    function: LocalToolFunction,
-}
-
-#[derive(Debug, Serialize)]
-struct LocalToolFunction {
-    name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    description: Option<String>,
-    parameters: Value,
-}
-
-#[derive(Debug, Deserialize)]
-struct LocalChatCompletionResponse {
-    #[serde(default)]
-    id: Option<String>,
-    #[serde(default)]
-    model: Option<String>,
-    #[serde(default)]
-    choices: Vec<LocalChoice>,
-    #[serde(default)]
-    usage: Option<LocalUsage>,
-}
-
-#[derive(Debug, Deserialize)]
-struct LocalChoice {
-    message: LocalAssistantMessage,
-    #[serde(default)]
-    finish_reason: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct LocalAssistantMessage {
-    #[serde(default)]
-    content: Option<Value>,
-    #[serde(default)]
-    tool_calls: Vec<LocalToolCallResponse>,
-}
-
-#[derive(Debug, Deserialize)]
-struct LocalToolCallResponse {
-    #[serde(default)]
-    id: Option<String>,
-    function: LocalToolCallFunctionResponse,
-}
-
-#[derive(Debug, Deserialize)]
-struct LocalToolCallFunctionResponse {
-    name: String,
-    #[serde(default)]
-    arguments: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct LocalUsage {
-    #[serde(default)]
-    prompt_tokens: u32,
-    #[serde(default)]
-    completion_tokens: u32,
-}
-
-fn build_local_chat_request(request: &MessageRequest) -> LocalChatCompletionRequest {
-    let mut messages = Vec::new();
-    if let Some(system) = request.system.as_ref().filter(|value| !value.trim().is_empty()) {
-        messages.push(LocalChatMessage {
-            role: "system".to_string(),
-            content: Some(Value::String(system.clone())),
-            tool_call_id: None,
-            tool_calls: None,
-        });
-    }
-    for message in &request.messages {
-        extend_local_messages(&mut messages, message);
-    }
-
-    LocalChatCompletionRequest {
-        model: request.model.clone(),
-        messages,
-        max_completion_tokens: request.max_tokens,
-        stream: false,
-        tools: request.tools.as_ref().map(convert_tool_definitions),
-        tool_choice: request.tool_choice.as_ref().map(convert_tool_choice),
-    }
-}
-
-fn extend_local_messages(target: &mut Vec<LocalChatMessage>, message: &InputMessage) {
-    let mut text_parts = Vec::new();
-    let mut tool_calls = Vec::new();
-
-    for block in &message.content {
-        match block {
-            InputContentBlock::Text { text } => {
-                if !text.is_empty() {
-                    text_parts.push(text.clone());
-                }
-            }
-            InputContentBlock::ToolUse { id, name, input } => {
-                tool_calls.push(LocalToolCall {
-                    id: id.clone(),
-                    kind: "function".to_string(),
-                    function: LocalToolCallFunction {
-                        name: name.clone(),
-                        arguments: canonical_json_string(input),
-                    },
-                });
-            }
-            InputContentBlock::ToolResult {
-                tool_use_id,
-                content,
-                ..
-            } => {
-                target.push(LocalChatMessage {
-                    role: "tool".to_string(),
-                    content: Some(Value::String(render_tool_result_content(content))),
-                    tool_call_id: Some(tool_use_id.clone()),
-                    tool_calls: None,
-                });
-            }
-        }
-    }
-
-    if text_parts.is_empty() && tool_calls.is_empty() {
-        return;
-    }
-
-    let role = if message.role.eq_ignore_ascii_case("assistant") {
-        "assistant"
-    } else {
-        "user"
-    };
-    target.push(LocalChatMessage {
-        role: role.to_string(),
-        content: (!text_parts.is_empty()).then(|| Value::String(text_parts.join("\n\n"))),
-        tool_call_id: None,
-        tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
-    });
-}
-
-fn convert_tool_definitions(tools: &Vec<ToolDefinition>) -> Vec<LocalToolDefinition> {
-    tools
-        .iter()
-        .map(|tool| LocalToolDefinition {
-            kind: "function".to_string(),
-            function: LocalToolFunction {
-                name: tool.name.clone(),
-                description: tool.description.clone(),
-                parameters: tool.input_schema.clone(),
-            },
-        })
-        .collect()
-}
-
-fn convert_tool_choice(choice: &ToolChoice) -> Value {
-    match choice {
-        ToolChoice::Auto => Value::String("auto".to_string()),
-        ToolChoice::Any => Value::String("required".to_string()),
-        ToolChoice::Tool { name } => json!({
-            "type": "function",
-            "function": { "name": name },
-        }),
-    }
-}
-
-fn render_tool_result_content(content: &[ToolResultContentBlock]) -> String {
-    let parts = content
-        .iter()
-        .map(|block| match block {
-            ToolResultContentBlock::Text { text } => text.clone(),
-            ToolResultContentBlock::Json { value } => canonical_json_string(value),
-        })
-        .collect::<Vec<_>>();
-    parts.join("\n")
-}
-
-fn completion_to_message_response(
-    request: &MessageRequest,
-    response: LocalChatCompletionResponse,
-) -> Result<MessageResponse, ApiError> {
-    let choice = response
-        .choices
-        .into_iter()
-        .next()
-        .ok_or_else(|| ApiError::Auth("local model returned no completion choices".to_string()))?;
-
-    let mut content = Vec::new();
-    let assistant_text = extract_assistant_text(choice.message.content.as_ref());
-    if !assistant_text.is_empty() {
-        content.push(OutputContentBlock::Text { text: assistant_text });
-    }
-
-    for (index, tool_call) in choice.message.tool_calls.into_iter().enumerate() {
-        let id = tool_call
-            .id
-            .unwrap_or_else(|| format!("tool_call_{index}"));
-        let input = parse_tool_arguments(&tool_call.function.arguments);
-        content.push(OutputContentBlock::ToolUse {
-            id,
-            name: tool_call.function.name,
-            input,
-        });
-    }
-
-    let usage = response.usage.unwrap_or(LocalUsage {
-        prompt_tokens: 0,
-        completion_tokens: 0,
-    });
-
-    Ok(MessageResponse {
-        id: response.id.unwrap_or_else(|| "local-msg".to_string()),
-        kind: "message".to_string(),
-        role: "assistant".to_string(),
-        content,
-        model: response.model.unwrap_or_else(|| request.model.clone()),
-        stop_reason: choice.finish_reason,
-        stop_sequence: None,
-        usage: Usage {
-            input_tokens: usage.prompt_tokens,
-            cache_creation_input_tokens: 0,
-            cache_read_input_tokens: 0,
-            output_tokens: usage.completion_tokens,
-        },
-        request_id: None,
-    })
-}
-
-fn extract_assistant_text(content: Option<&Value>) -> String {
-    match content {
-        Some(Value::String(text)) => text.clone(),
-        Some(Value::Array(parts)) => parts
-            .iter()
-            .filter_map(|part| match part {
-                Value::Object(object) if object.get("type") == Some(&Value::String("text".to_string())) => {
-                    object.get("text").and_then(Value::as_str).map(ToOwned::to_owned)
-                }
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join(""),
-        Some(Value::Null) | None => String::new(),
-        Some(other) => other.to_string(),
-    }
-}
-
-fn parse_tool_arguments(arguments: &str) -> Value {
-    serde_json::from_str(arguments).unwrap_or_else(|_| json!({ "raw": arguments }))
-}
-
-fn canonical_json_string(value: &Value) -> String {
-    serde_json::to_string(value).unwrap_or_else(|_| value.to_string())
 }
 
 async fn expect_success(response: reqwest::Response) -> Result<reqwest::Response, ApiError> {
