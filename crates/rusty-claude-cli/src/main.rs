@@ -411,6 +411,13 @@ fn print_bootstrap_plan() {
     }
 }
 
+fn run_login() -> Result<(), Box<dyn std::error::Error>> {
+    Err(io::Error::other("offline builds do not support provider login; set CLAW_LOCAL_BASE_URL to a local model endpoint").into())
+}
+
+fn run_logout() -> Result<(), Box<dyn std::error::Error>> {
+    Err(io::Error::other("offline builds do not maintain provider credentials").into())
+}
 
 fn print_system_prompt(cwd: PathBuf, date: String) {
     match load_system_prompt(cwd, date, env::consts::OS, "unknown") {

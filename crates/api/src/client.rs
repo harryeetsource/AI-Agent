@@ -89,29 +89,36 @@ impl LocalModelClient {
         request: &MessageRequest,
     ) -> Result<reqwest::Response, ApiError> {
         let mut attempts = 0;
+        let mut last_error: Option<ApiError> = None;
 
-        let last_error = loop {
+        loop {
             attempts += 1;
             match self.send_raw_request(request).await {
                 Ok(response) => match expect_success(response).await {
                     Ok(response) => return Ok(response),
-                    Err(error) if error.is_retryable() && attempts <= self.max_retries => {
-                        tokio::time::sleep(self.backoff_for_attempt(attempts)?).await;
-                        continue;
+                    Err(error) if error.is_retryable() && attempts <= self.max_retries + 1 => {
+                        last_error = Some(error);
                     }
-                    Err(error) => break error,
+                    Err(error) => return Err(error),
                 },
-                Err(error) if error.is_retryable() && attempts <= self.max_retries => {
-                    tokio::time::sleep(self.backoff_for_attempt(attempts)?).await;
-                    continue;
+                Err(error) if error.is_retryable() && attempts <= self.max_retries + 1 => {
+                    last_error = Some(error);
                 }
-                Err(error) => break error,
+                Err(error) => return Err(error),
             }
-        };
+
+            if attempts > self.max_retries {
+                break;
+            }
+
+            tokio::time::sleep(self.backoff_for_attempt(attempts)?).await;
+        }
 
         Err(ApiError::RetriesExhausted {
             attempts,
-            last_error: Box::new(last_error),
+            last_error: Box::new(last_error.unwrap_or_else(|| {
+                ApiError::Auth("local model request failed without a captured root cause".to_string())
+            })),
         })
     }
 

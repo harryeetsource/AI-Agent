@@ -158,3 +158,50 @@ cargo run -p rusty-claude-cli -- prompt "summarize this repo"
 - `crates/runtime/` — conversation runtime, sessions, permissions, prompts
 - `crates/tools/` — tool registry and subagent support
 - `crates/rusty-claude-cli/` — main CLI binary (`claw`)
+
+
+## Included starter layout in this zip
+
+This archive now includes the starter offline directories and helper files:
+
+- `data/models/` — put your GGUF coding model here
+- `data/corpus/` — put Rust, asm, and docs here before indexing
+- `data/schema.sql` — SQLite schema for `knowledge.db`
+- `runners/llama/` — put `llama-server` / `llama-server.exe` here
+- `scripts/run-llama.ps1` and `scripts/run-llama.sh` — helper scripts to launch llama.cpp locally
+- `scripts/init-knowledge-db.ps1` and `scripts/init-knowledge-db.sh` — helper scripts to initialize `data/knowledge.db`
+- `.env.example` — starter environment configuration
+
+### Expected local layout
+
+```text
+rust/
+├── data/
+│   ├── models/
+│   │   └── qwen2.5-coder-1.5b-instruct-q4_k_m.gguf
+│   ├── knowledge.db
+│   └── corpus/
+│       ├── rust/
+│       ├── asm/
+│       └── docs/
+├── runners/
+│   └── llama/
+│       ├── llama-server.exe
+│       └── llama-cli.exe
+├── scripts/
+└── .env.example
+```
+
+### First-time setup
+
+1. Put your GGUF model in `data/models/`.
+2. Put your llama.cpp binaries in `runners/llama/`.
+3. Initialize the retrieval DB with:
+   - PowerShell: `./scripts/init-knowledge-db.ps1`
+   - bash: `./scripts/init-knowledge-db.sh`
+4. Start llama.cpp:
+   - PowerShell: `./scripts/run-llama.ps1`
+   - bash: `./scripts/run-llama.sh`
+5. Start the Claw daemon or CLI with `CLAW_LOCAL_BASE_URL=http://127.0.0.1:8080`.
+
+The zip does **not** include actual model weights or llama.cpp binaries because they are separate large downloads, but the layout and helper scripts are now included and ready for them.
