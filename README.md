@@ -1,207 +1,155 @@
 # Claw Code (Offline Rewrite)
 
 This fork is configured for **local-only model execution**.
-It no longer depends on Anthropic credentials, OAuth login, or OpenAI-compatible endpoints.
+It no longer depends on Anthropic credentials or provider login flows.
 
 ## Offline architecture
 
-Claw now expects a **local Claw model daemon** that implements a small native HTTP API:
+Claw now expects a **local Claw model daemon** that implements a native HTTP API:
 
 - `POST /v1/messages`
 - request body: `crates/api::types::MessageRequest`
 - response body: `crates/api::types::MessageResponse`
 
-Default base URL:
+By default, the CLI talks to:
 
 ```bash
 CLAW_LOCAL_BASE_URL=http://127.0.0.1:8080
 ```
 
-If `CLAW_LOCAL_BASE_URL` is not set, the client defaults to `http://127.0.0.1:8080`.
+The included `clawd` daemon is the local bridge you ship with Claw. It listens on `127.0.0.1:8080` by default and forwards Claw-native `MessageRequest` payloads to your local model runner.
+
+## Included starter pieces
+
+- `crates/clawd/` — local native daemon
+- `data/schema.sql` — SQLite schema for `knowledge.db`
+- `data/corpus/` — starter corpus directories
+- `data/models/` — place GGUF model files here
+- `runners/llama/` — place `llama.cpp` binaries here
+- `scripts/init-knowledge-db.*` — initialize the SQLite DB
+- `scripts/run-llama.*` — start `llama-server`
+- `scripts/run-clawd.*` — start the Claw-native bridge daemon
 
 ## What you need locally
 
-You need three things to run the agent offline:
+1. **A local model file**
+   - example: `data/models/qwen2.5-coder-1.5b-instruct-q4_k_m.gguf`
 
-1. **A local model daemon**
-   - host your chosen local model behind `POST /v1/messages`
-   - keep the transport native to Claw instead of depending on OpenAI-compatible schemas
+2. **A local runner binary**
+   - example: `runners/llama/llama-server.exe`
 
-2. **A local retrieval database**
-   - recommended: `SQLite` with `FTS5`
-   - file example: `data/knowledge.db`
+3. **A local retrieval database**
+   - example: `data/knowledge.db`
 
-3. **A local corpus / dataset directory**
-   - recommended root: `data/corpus/`
-   - include Rust source, docs, examples, API notes, assembly references, and any curated engineering examples
+4. **A local corpus directory**
+   - example: `data/corpus/`
 
-## Recommended database layout
+## Runner compatibility
 
-Create a SQLite database and enable FTS5. A good starting layout is:
+`llama.cpp` exposes an HTTP server that supports OpenAI-compatible routes and an **Anthropic Messages API compatible** route. That makes it a practical local backend for Claw while keeping Claw's external API native. citeturn749974search0turn749974search1
 
-- `documents`
-  - `id`
-  - `path`
-  - `kind`
-  - `sha256`
-  - `updated_at`
-- `chunks`
-  - `id`
-  - `document_id`
-  - `chunk_index`
-  - `text`
-- `chunks_fts`
-  - FTS5 virtual table over `text`
-- `sessions`
-  - session transcripts and summaries
-- `tool_results`
-  - cached tool outputs and structured notes
-
-## Suggested offline corpus contents
-
-Populate `data/corpus/` with compact, high-value material instead of giant web dumps:
-
-- this Claw workspace
-- Rust standard library notes you rely on frequently
-- Rust examples and internal coding patterns
-- assembly references and calling-convention notes
-- curated bug-fix examples
-- local markdown design notes
-
-For a desktop-friendly setup, prefer:
-
-- your own repo and docs first
-- curated Rust/assembly examples second
-- SQLite FTS retrieval over massive raw datasets
-
-## Minimal setup flow
-
-### 1. Create the data directories
+The included `clawd` daemon forwards Claw requests to the runner at:
 
 ```bash
-mkdir -p data/corpus
-mkdir -p data/db
+CLAW_RUNNER_BASE_URL=http://127.0.0.1:8081
+CLAW_RUNNER_MESSAGES_PATH=/v1/messages
 ```
 
-### 2. Create the SQLite database
-
-```bash
-sqlite3 data/db/knowledge.db <<'SQL'
-CREATE TABLE IF NOT EXISTS documents (
-    id INTEGER PRIMARY KEY,
-    path TEXT NOT NULL UNIQUE,
-    kind TEXT NOT NULL,
-    sha256 TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS chunks (
-    id INTEGER PRIMARY KEY,
-    document_id INTEGER NOT NULL,
-    chunk_index INTEGER NOT NULL,
-    text TEXT NOT NULL,
-    FOREIGN KEY(document_id) REFERENCES documents(id)
-);
-
-CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
-    text,
-    content='chunks',
-    content_rowid='id'
-);
-
-CREATE TABLE IF NOT EXISTS sessions (
-    id INTEGER PRIMARY KEY,
-    session_key TEXT NOT NULL UNIQUE,
-    summary TEXT,
-    transcript_json TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS tool_results (
-    id INTEGER PRIMARY KEY,
-    tool_name TEXT NOT NULL,
-    input_json TEXT NOT NULL,
-    output_json TEXT NOT NULL,
-    created_at TEXT NOT NULL
-);
-SQL
-```
-
-### 3. Seed the corpus
-
-Copy the Claw repo, your Rust notes, and assembly references into `data/corpus/`.
-Then chunk and ingest them into `knowledge.db`.
-
-### 4. Start your local model daemon
-
-Your daemon should accept Claw-native `MessageRequest` JSON and return Claw-native `MessageResponse` JSON.
-
-### 5. Run Claw
-
-```bash
-export CLAW_LOCAL_BASE_URL="http://127.0.0.1:8080"
-cargo run -p rusty-claude-cli --
-cargo run -p rusty-claude-cli -- prompt "summarize this repo"
-```
-
-## Current direction
-
-- offline-first runtime
-- native local transport
-- no provider login/logout flow
-- SQLite-backed local retrieval
-- Rust and assembly corpus integration layered on top
-
-## Workspace
-
-- `crates/api/` — local model transport and request/response types
-- `crates/runtime/` — conversation runtime, sessions, permissions, prompts
-- `crates/tools/` — tool registry and subagent support
-- `crates/rusty-claude-cli/` — main CLI binary (`claw`)
-
-
-## Included starter layout in this zip
-
-This archive now includes the starter offline directories and helper files:
-
-- `data/models/` — put your GGUF coding model here
-- `data/corpus/` — put Rust, asm, and docs here before indexing
-- `data/schema.sql` — SQLite schema for `knowledge.db`
-- `runners/llama/` — put `llama-server` / `llama-server.exe` here
-- `scripts/run-llama.ps1` and `scripts/run-llama.sh` — helper scripts to launch llama.cpp locally
-- `scripts/init-knowledge-db.ps1` and `scripts/init-knowledge-db.sh` — helper scripts to initialize `data/knowledge.db`
-- `.env.example` — starter environment configuration
-
-### Expected local layout
+## Directory layout
 
 ```text
 rust/
+├── crates/
+│   └── clawd/
 ├── data/
 │   ├── models/
-│   │   └── qwen2.5-coder-1.5b-instruct-q4_k_m.gguf
-│   ├── knowledge.db
-│   └── corpus/
-│       ├── rust/
-│       ├── asm/
-│       └── docs/
+│   ├── corpus/
+│   ├── schema.sql
+│   └── knowledge.db
 ├── runners/
 │   └── llama/
-│       ├── llama-server.exe
-│       └── llama-cli.exe
 ├── scripts/
+│   ├── init-knowledge-db.ps1
+│   ├── init-knowledge-db.sh
+│   ├── run-llama.ps1
+│   ├── run-llama.sh
+│   ├── run-clawd.ps1
+│   └── run-clawd.sh
 └── .env.example
 ```
 
-### First-time setup
+## Minimal setup
 
-1. Put your GGUF model in `data/models/`.
-2. Put your llama.cpp binaries in `runners/llama/`.
-3. Initialize the retrieval DB with:
-   - PowerShell: `./scripts/init-knowledge-db.ps1`
-   - bash: `./scripts/init-knowledge-db.sh`
-4. Start llama.cpp:
-   - PowerShell: `./scripts/run-llama.ps1`
-   - bash: `./scripts/run-llama.sh`
-5. Start the Claw daemon or CLI with `CLAW_LOCAL_BASE_URL=http://127.0.0.1:8080`.
+### 1. Put your model here
 
-The zip does **not** include actual model weights or llama.cpp binaries because they are separate large downloads, but the layout and helper scripts are now included and ready for them.
+```text
+data/models/qwen2.5-coder-1.5b-instruct-q4_k_m.gguf
+```
+
+### 2. Put your runner binaries here
+
+Windows:
+
+```text
+runners/llama/llama-server.exe
+runners/llama/llama-cli.exe
+```
+
+### 3. Initialize the database
+
+PowerShell:
+
+```powershell
+powershell -ep bypass .\scripts\init-knowledge-db.ps1
+```
+
+Bash:
+
+```bash
+./scripts/init-knowledge-db.sh
+```
+
+### 4. Start llama.cpp on port 8081
+
+PowerShell:
+
+```powershell
+powershell -ep bypass .\scriptsun-llama.ps1
+```
+
+Bash:
+
+```bash
+./scripts/run-llama.sh
+```
+
+### 5. Start the Claw-native daemon on port 8080
+
+PowerShell:
+
+```powershell
+powershell -ep bypass .\scriptsun-clawd.ps1
+```
+
+Bash:
+
+```bash
+./scripts/run-clawd.sh
+```
+
+### 6. Start the CLI
+
+```bash
+cargo run -p rusty-claude-cli --
+```
+
+Single-prompt mode:
+
+```bash
+cargo run -p rusty-claude-cli -- prompt "summarize this repo"
+```
+
+## Notes
+
+- The helper scripts now resolve paths relative to the repo, not the current shell directory.
+- `clawd` is intentionally small: it is the ship-ready local bridge, while `llama.cpp` remains the inference engine and `knowledge.db` remains the retrieval layer.

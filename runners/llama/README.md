@@ -1,19 +1,15 @@
-# Put llama.cpp binaries here
+# llama.cpp runner placement
 
-Place your local llama.cpp binaries in this directory.
+Place your local llama.cpp binaries here.
 
-Expected starter layout on Windows:
-
+Windows example:
 - `llama-server.exe`
 - `llama-cli.exe`
-- any required DLLs shipped with your build
 
-Expected starter layout on Linux/macOS:
-
+Linux/macOS example:
 - `llama-server`
 - `llama-cli`
-- any required shared libraries shipped with your build
 
-Recommended model location:
-
-- `../../data/models/qwen2.5-coder-1.5b-instruct-q4_k_m.gguf`
+The helper scripts expect the server binary at:
+- Windows: `runners/llama/llama-server.exe`
+- Unix: `runners/llama/llama-server`
