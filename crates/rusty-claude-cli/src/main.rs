@@ -16,8 +16,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use api::{
     ContentBlockDelta, InputContentBlock, InputMessage, LocalModelClient, MessageRequest,
-    MessageResponse, OutputContentBlock, StreamEvent as ApiStreamEvent, ToolChoice,
-    ToolDefinition, ToolResultContentBlock,
+    MessageResponse, OutputContentBlock, StreamEvent as ApiStreamEvent,
+    ToolChoice, ToolDefinition, ToolResultContentBlock,
 };
 
 use commands::{
@@ -27,7 +27,7 @@ use commands::{
 use compat_harness::{extract_manifest, UpstreamPaths};
 use init::initialize_repo;
 use plugins::{PluginManager, PluginManagerConfig, PluginRegistry};
-use render::{MarkdownStreamState, Spinner, TerminalRenderer};
+use render::{MarkdownStreamState, TerminalRenderer};
 use runtime::{
     ApiClient, ApiRequest, AssistantEvent, CompactionConfig, ConfigLoader, ConfigSource,
     ContentBlock, ConversationMessage, ConversationRuntime, MessageRole, PermissionMode,
@@ -340,7 +340,11 @@ fn filter_tool_specs(
     tool_registry: &GlobalToolRegistry,
     allowed_tools: Option<&AllowedToolSet>,
 ) -> Vec<ToolDefinition> {
-    tool_registry.definitions(allowed_tools)
+    let mut definitions = tool_registry.definitions(allowed_tools);
+    definitions.retain(|tool| {
+        !matches!(tool.name.as_str(), "SendUserMessage" | "ToolSearch")
+    });
+    definitions
 }
 
 fn parse_system_prompt_args(args: &[String]) -> Result<CliAction, String> {
@@ -976,24 +980,12 @@ impl LiveCli {
 
     fn run_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
         let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(true)?;
-        let mut spinner = Spinner::new();
-        let mut stdout = io::stdout();
-        spinner.tick(
-            "🦀 Thinking...",
-            TerminalRenderer::new().color_theme(),
-            &mut stdout,
-        )?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
         let result = runtime.run_turn(input, Some(&mut permission_prompter));
         hook_abort_monitor.stop();
         self.runtime = runtime;
         match result {
             Ok(summary) => {
-                spinner.finish(
-                    "✨ Done",
-                    TerminalRenderer::new().color_theme(),
-                    &mut stdout,
-                )?;
                 println!();
                 if let Some(event) = summary.auto_compaction {
                     println!(
@@ -1005,11 +997,7 @@ impl LiveCli {
                 Ok(())
             }
             Err(error) => {
-                spinner.fail(
-                    "❌ Request failed",
-                    TerminalRenderer::new().color_theme(),
-                    &mut stdout,
-                )?;
+                eprintln!("✘ ❌ Request failed");
                 Err(Box::new(error))
             }
         }
@@ -2291,12 +2279,25 @@ fn resolve_export_path(
 }
 
 fn build_system_prompt() -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    Ok(load_system_prompt(
+    let mut prompt = load_system_prompt(
         env::current_dir()?,
         DEFAULT_DATE,
         env::consts::OS,
         "unknown",
-    )?)
+    )?;
+    prompt.push(
+        [
+            "# Tool use policy",
+            "- Use tools only when they materially help complete the user's request.",
+            "- Do not call tools for simple greetings, conversational replies, explanations, brainstorming, or questions that can be answered directly from existing context.",
+            "- Before using a tool, prefer to answer directly when no external action, file access, search, or state change is needed.",
+            "- When a tool is genuinely needed, choose the smallest relevant tool action and then continue with a normal natural-language answer after the tool result.",
+            "- Do not emit raw tool JSON to the user outside structured tool-use blocks.",
+        ]
+        .join("
+"),
+    );
+    Ok(prompt)
 }
 
 fn build_runtime_plugin_state() -> Result<
@@ -2837,15 +2838,21 @@ impl ApiClient for LocalRuntimeClient {
         if let Some(progress_reporter) = &self.progress_reporter {
             progress_reporter.mark_model_phase();
         }
+        let tools = if self.enable_tools {
+            filter_tool_specs(&self.tool_registry, self.allowed_tools.as_ref())
+        } else {
+            Vec::new()
+        };
+        let has_tools = !tools.is_empty();
         let message_request = MessageRequest {
             model: self.model.clone(),
             max_tokens: max_tokens_for_model(&self.model),
             messages: convert_messages(&request.messages),
-            system: (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n")),
-            tools: self
-                .enable_tools
-                .then(|| filter_tool_specs(&self.tool_registry, self.allowed_tools.as_ref())),
-            tool_choice: self.enable_tools.then_some(ToolChoice::Auto),
+            system: (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("
+
+")),
+            tools: has_tools.then_some(tools),
+            tool_choice: has_tools.then_some(ToolChoice::Auto),
             stream: true,
         };
 
@@ -3083,6 +3090,58 @@ fn format_tool_call_start(name: &str, input: &str) -> String {
             .and_then(|value| value.as_str())
             .unwrap_or("?")
             .to_string(),
+        "WebFetch" => {
+            let url = parsed
+                .get("url")
+                .and_then(|value| value.as_str())
+                .unwrap_or("?");
+            let prompt = parsed
+                .get("prompt")
+                .and_then(|value| value.as_str())
+                .map(|value| truncate_for_summary(value, 120))
+                .unwrap_or_default();
+            if prompt.is_empty() {
+                format!("🌐 Fetching {url}")
+            } else {
+                format!("🌐 Fetching {url}
+[2mReason: {prompt}[0m")
+            }
+        }
+        "TodoWrite" => {
+            let todos = parsed
+                .get("todos")
+                .and_then(|value| value.as_array())
+                .cloned()
+                .unwrap_or_default();
+            if todos.is_empty() {
+                "🗒️ Updating todo list".to_string()
+            } else {
+                let preview = todos
+                    .iter()
+                    .take(4)
+                    .filter_map(|todo| todo.get("content").and_then(|value| value.as_str()))
+                    .map(|todo| format!("• {todo}"))
+                    .collect::<Vec<_>>()
+                    .join("
+");
+                let suffix = if todos.len() > 4 { "
+[2m…more todos omitted[0m" } else { "" };
+                format!("🗒️ Updating {} todo{}
+{}{}", todos.len(), if todos.len() == 1 { "" } else { "s" }, preview, suffix)
+            }
+        }
+        "SendUserMessage" => parsed
+            .get("message")
+            .and_then(|value| value.as_str())
+            .map(|message| format!("💬 Replying to you
+[2m{}[0m", truncate_for_summary(message, 120)))
+            .unwrap_or_else(|| "💬 Replying to you".to_string()),
+        "ToolSearch" => parsed
+            .get("query")
+            .and_then(|value| value.as_str())
+            .map(|query| format!("🧰 Looking for a relevant tool
+[2mQuery: {}[0m", truncate_for_summary(query, 120)))
+            .unwrap_or_else(|| "🧰 Looking for a relevant tool".to_string()),
         _ => summarize_tool_payload(input),
     };
 
@@ -3116,6 +3175,37 @@ fn format_tool_result(name: &str, output: &str, is_error: bool) -> String {
         "edit_file" | "Edit" => format_edit_result(icon, &parsed),
         "glob_search" | "Glob" => format_glob_result(icon, &parsed),
         "grep_search" | "Grep" => format_grep_result(icon, &parsed),
+        "WebFetch" => format_generic_tool_result(icon, "web fetch", &parsed),
+        "TodoWrite" => {
+            let count = parsed
+                .get("todos")
+                .and_then(|value| value.as_array())
+                .map_or(0, |todos| todos.len());
+            if count == 0 {
+                format!("{icon} todo list updated")
+            } else {
+                format!("{icon} updated {count} todo{}", if count == 1 { "" } else { "s" })
+            }
+        }
+        "SendUserMessage" => parsed
+            .get("message")
+            .and_then(|value| value.as_str())
+            .map(|message| message.to_string())
+            .unwrap_or_else(|| format!("{icon} replied to user")),
+        "ToolSearch" => {
+            let matches = parsed
+                .get("matches")
+                .and_then(|value| value.as_array())
+                .cloned()
+                .unwrap_or_default();
+            if matches.is_empty() {
+                format!("{icon} no matching tools found")
+            } else {
+                let preview = matches.iter().take(5).filter_map(|v| v.as_str()).collect::<Vec<_>>().join(", ");
+                let suffix = if matches.len() > 5 { ", …" } else { "" };
+                format!("{icon} found {} tool{}: {}{}", matches.len(), if matches.len() == 1 { "" } else { "s" }, preview, suffix)
+            }
+        }
         _ => format_generic_tool_result(icon, name, &parsed),
     }
 }

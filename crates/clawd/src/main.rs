@@ -5,8 +5,8 @@ use std::time::Duration;
 use api::{MessageRequest, MessageResponse};
 use axum::{
     extract::State,
-    http::StatusCode,
-    response::IntoResponse,
+    http::{header, HeaderValue, StatusCode},
+    response::{Html, IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
@@ -74,6 +74,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let app = Router::new()
+        .route("/", get(index))
+        .route("/static/app.js", get(static_app_js))
+        .route("/static/styles.css", get(static_styles_css))
         .route("/health", get(health))
         .route("/v1/messages", post(messages))
         .with_state(state);
@@ -109,6 +112,30 @@ async fn shutdown_signal() {
         _ = ctrl_c => {},
         _ = terminate => {},
     }
+}
+
+
+
+async fn index() -> Html<&'static str> {
+    Html(include_str!("../static/index.html"))
+}
+
+async fn static_app_js() -> Response {
+    let mut response = Response::new(include_str!("../static/app.js").into());
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/javascript; charset=utf-8"),
+    );
+    response
+}
+
+async fn static_styles_css() -> Response {
+    let mut response = Response::new(include_str!("../static/styles.css").into());
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/css; charset=utf-8"),
+    );
+    response
 }
 
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
