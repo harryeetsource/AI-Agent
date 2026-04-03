@@ -144,10 +144,15 @@ async fn forward_message_request(
     state: &AppState,
     request: &MessageRequest,
 ) -> Result<MessageResponse, Box<dyn std::error::Error + Send + Sync>> {
+    let mut runner_request = request.clone();
+    // The local API client already synthesizes streaming events from a full MessageResponse.
+    // Force non-streaming here so llama.cpp returns a single JSON object instead of SSE.
+    runner_request.stream = false;
+
     let response = state
         .http
         .post(&state.runner_messages_url)
-        .json(request)
+        .json(&runner_request)
         .send()
         .await?;
 
@@ -163,7 +168,14 @@ async fn forward_message_request(
         .into());
     }
 
-    let message = serde_json::from_str::<MessageResponse>(&body)?;
+    let message = serde_json::from_str::<MessageResponse>(&body).map_err(|error| {
+        format!(
+            "runner returned invalid JSON from {}: {} | body: {}",
+            state.runner_messages_url,
+            error,
+            body
+        )
+    })?;
     Ok(message)
 }
 

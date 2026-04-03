@@ -411,6 +411,7 @@ fn print_bootstrap_plan() {
     }
 }
 
+
 fn print_system_prompt(cwd: PathBuf, date: String) {
     match load_system_prompt(cwd, date, env::consts::OS, "unknown") {
         Ok(sections) => println!("{}", sections.join("\n\n")),

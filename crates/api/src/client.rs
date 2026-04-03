@@ -89,30 +89,29 @@ impl LocalModelClient {
         request: &MessageRequest,
     ) -> Result<reqwest::Response, ApiError> {
         let mut attempts = 0;
-
-        loop {
+        let last_error = loop {
             attempts += 1;
-            let error = match self.send_raw_request(request).await {
+            match self.send_raw_request(request).await {
                 Ok(response) => match expect_success(response).await {
                     Ok(response) => return Ok(response),
-                    Err(error) => error,
+                    Err(error) if error.is_retryable() && attempts <= self.max_retries => {
+                        tokio::time::sleep(self.backoff_for_attempt(attempts)?).await;
+                        continue;
+                    }
+                    Err(error) => break error,
                 },
-                Err(error) => error,
-            };
-
-            if !error.is_retryable() {
-                return Err(error);
+                Err(error) if error.is_retryable() && attempts <= self.max_retries => {
+                    tokio::time::sleep(self.backoff_for_attempt(attempts)?).await;
+                    continue;
+                }
+                Err(error) => break error,
             }
+        };
 
-            if attempts > self.max_retries {
-                return Err(ApiError::RetriesExhausted {
-                    attempts,
-                    last_error: Box::new(error),
-                });
-            }
-
-            tokio::time::sleep(self.backoff_for_attempt(attempts)?).await;
-        }
+        Err(ApiError::RetriesExhausted {
+            attempts,
+            last_error: Box::new(last_error),
+        })
     }
 
     async fn send_raw_request(

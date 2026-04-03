@@ -8,17 +8,17 @@ param(
 $ErrorActionPreference = "Stop"
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 
-$ClawdPath = Join-Path $RepoRoot "target\release\clawd.exe"
-
-if (!(Test-Path $ClawdPath)) {
-    throw "clawd binary not found at $ClawdPath. Build with: cargo build --release -p clawd"
-}
-
 $env:CLAW_RUNNER_BASE_URL = $RunnerBaseUrl
 $env:CLAW_RUNNER_MESSAGES_PATH = $RunnerMessagesPath
 $env:CLAWD_HOST = $BindHost
 $env:CLAWD_PORT = "$Port"
 $env:CLAW_LOCAL_BASE_URL = "http://${BindHost}:$Port"
+
+$ClawdPath = Join-Path $RepoRoot "target\release\clawd.exe"
+
+if (-not (Test-Path $ClawdPath)) {
+    throw "clawd binary not found: $ClawdPath"
+}
 
 Write-Host "Starting clawd..."
 Write-Host "Binary: $ClawdPath"
