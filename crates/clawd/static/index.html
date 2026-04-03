@@ -9,19 +9,38 @@
 <body>
   <div class="app-shell">
     <aside class="sidebar">
-      <div class="brand">🦞 Claw Offline</div>
+      <div class="brand-wrap">
+        <div class="brand-mark">🦞</div>
+        <div>
+          <div class="brand">Claw Offline</div>
+          <div class="brand-sub">Local coding assistant</div>
+        </div>
+      </div>
+
       <div class="status-card">
+        <div class="status-title">Status</div>
         <div class="status-row"><span>Daemon</span><span id="daemon-status">Checking…</span></div>
         <div class="status-row"><span>Runner</span><span id="runner-status">Unknown</span></div>
       </div>
-      <button id="clear-chat" class="secondary">Clear chat</button>
-      <p class="hint">Open <code>/health</code> to verify backend status. This UI talks directly to <code>/v1/messages</code>.</p>
+
+      <div class="status-card compact-controls">
+        <div class="status-title">View</div>
+        <label class="toggle-row">
+          <input type="checkbox" id="wrap-code" checked>
+          <span>Wrap long code lines</span>
+        </label>
+      </div>
+
+      <button id="clear-chat" class="secondary full-width">Clear chat</button>
+      <p class="hint">This UI talks to <code>/v1/messages</code>. Use Ctrl+Enter to send. Code blocks include one-click copy.</p>
     </aside>
 
     <main class="chat-shell">
       <header class="chat-header">
-        <h1>Offline coding assistant</h1>
-        <p>Multi-line input, readable code blocks, and one-click copy.</p>
+        <div>
+          <h1>Offline coding assistant</h1>
+          <p>Readable markdown, wrapped code blocks, and cleaner copy-friendly output.</p>
+        </div>
       </header>
 
       <div id="activity" class="activity hidden" aria-live="polite">Thinking…</div>
@@ -30,7 +49,7 @@
 
       <form id="composer" class="composer">
         <label for="prompt" class="sr-only">Message</label>
-        <textarea id="prompt" rows="8" placeholder="Ask about Rust, assembly, debugging, refactors, or your local codebase…"></textarea>
+        <textarea id="prompt" rows="8" placeholder="Ask about Rust, debugging, assembly, refactors, APIs, or paste code here…"></textarea>
         <div class="composer-actions">
           <div class="small-note">Ctrl+Enter to send · Shift+Enter for newline</div>
           <div class="buttons">
@@ -45,7 +64,10 @@
   <template id="message-template">
     <article class="message-card">
       <div class="message-meta">
-        <span class="message-role"></span>
+        <div class="message-meta-left">
+          <span class="message-role"></span>
+          <span class="message-time"></span>
+        </div>
         <button class="copy-message secondary small">Copy</button>
       </div>
       <div class="message-body"></div>

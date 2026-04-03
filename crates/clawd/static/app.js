@@ -8,13 +8,20 @@ const daemonStatusEl = document.getElementById('daemon-status');
 const runnerStatusEl = document.getElementById('runner-status');
 const activityEl = document.getElementById('activity');
 const messageTemplate = document.getElementById('message-template');
+const wrapCodeCheckbox = document.getElementById('wrap-code');
 
-const state = { messages: [] };
+const state = {
+  messages: [],
+  wrapCode: true,
+};
 
 function cloneMessageCard(role) {
   const fragment = messageTemplate.content.cloneNode(true);
   const card = fragment.querySelector('.message-card');
-  card.querySelector('.message-role').textContent = role;
+  card.dataset.role = role;
+  card.classList.add(`role-${role}`);
+  card.querySelector('.message-role').textContent = role === 'user' ? 'You' : 'Assistant';
+  card.querySelector('.message-time').textContent = new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
   return card;
 }
 
@@ -22,39 +29,87 @@ function escapeHtml(value) {
   return String(value)
     .replaceAll('&', '&amp;')
     .replaceAll('<', '&lt;')
-    .replaceAll('>', '&gt;');
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;');
+}
+
+function renderInline(text) {
+  let html = escapeHtml(text);
+  html = html.replace(/`([^`]+)`/g, '<code class="inline-code">$1</code>');
+  return html.replace(/\n/g, '<br>');
+}
+
+function splitFencedBlocks(source) {
+  const text = String(source ?? '');
+  const blocks = [];
+  let lastIndex = 0;
+  const regex = /```([A-Za-z0-9_+\-#.]+)?\n([\s\S]*?)```/g;
+  let match;
+
+  while ((match = regex.exec(text)) !== null) {
+    if (match.index > lastIndex) {
+      blocks.push({ type: 'text', value: text.slice(lastIndex, match.index) });
+    }
+    blocks.push({
+      type: 'code',
+      lang: (match[1] || '').trim(),
+      value: match[2].replace(/\n$/, ''),
+    });
+    lastIndex = regex.lastIndex;
+  }
+
+  if (lastIndex < text.length) {
+    blocks.push({ type: 'text', value: text.slice(lastIndex) });
+  }
+
+  return blocks;
 }
 
 function renderMarkdownish(text) {
-  const source = String(text ?? '');
-  const parts = source.split(/```/g);
-  let html = '';
+  const blocks = splitFencedBlocks(text);
+  const html = [];
 
-  for (let i = 0; i < parts.length; i++) {
-    if (i % 2 === 1) {
-      let code = parts[i];
-      const firstNewline = code.indexOf('\n');
-      if (firstNewline !== -1) {
-        const maybeLang = code.slice(0, firstNewline).trim();
-        if (/^[A-Za-z0-9_+\-#.]+$/.test(maybeLang)) {
-          code = code.slice(firstNewline + 1);
-        }
-      }
-      html += `<pre><code>${escapeHtml(code)}</code></pre>`;
+  for (const block of blocks) {
+    if (block.type === 'code') {
+      const lang = block.lang || 'code';
+      html.push(`
+        <div class="code-block ${state.wrapCode ? 'wrap' : 'scroll'}">
+          <div class="code-toolbar">
+            <span class="code-lang">${escapeHtml(lang)}</span>
+            <button type="button" class="copy-code secondary small">Copy code</button>
+          </div>
+          <pre><code>${escapeHtml(block.value)}</code></pre>
+        </div>
+      `);
       continue;
     }
 
-    const paragraphs = parts[i]
+    const paragraphs = block.value
       .split(/\n{2,}/)
       .map((p) => p.trim())
       .filter(Boolean)
-      .map((p) => `<p>${escapeHtml(p).replace(/\n/g, '<br>')}</p>`)
+      .map((p) => `<p>${renderInline(p)}</p>`)
       .join('');
 
-    html += paragraphs;
+    if (paragraphs) {
+      html.push(paragraphs);
+    }
   }
 
-  return html || '<p></p>';
+  return html.join('') || '<p></p>';
+}
+
+function wireCodeButtons(body) {
+  for (const button of body.querySelectorAll('.copy-code')) {
+    button.addEventListener('click', async () => {
+      const code = button.closest('.code-block')?.querySelector('code')?.textContent ?? '';
+      await navigator.clipboard.writeText(code);
+      const original = button.textContent;
+      button.textContent = 'Copied';
+      setTimeout(() => { button.textContent = original; }, 1200);
+    });
+  }
 }
 
 function createMessageCard(role, content = '', rawForCopy = content, extraClass = '') {
@@ -68,8 +123,12 @@ function createMessageCard(role, content = '', rawForCopy = content, extraClass 
 
   const update = (nextContent, nextRaw = nextContent) => {
     body.innerHTML = renderMarkdownish(nextContent);
+    wireCodeButtons(body);
     copyButton.onclick = async () => {
       await navigator.clipboard.writeText(String(nextRaw ?? ''));
+      const original = copyButton.textContent;
+      copyButton.textContent = 'Copied';
+      setTimeout(() => { copyButton.textContent = original; }, 1200);
     };
     messagesEl.scrollTop = messagesEl.scrollHeight;
   };
@@ -96,26 +155,20 @@ function setActivity(message) {
 }
 
 async function animateAssistantText(messageView, finalText, rawForCopy) {
-  const chunks = String(finalText ?? '').match(/.{1,24}|\n+/gs) || [''];
+  const chunks = String(finalText ?? '').match(/.{1,28}|\n+/gs) || [''];
   let built = '';
   for (let i = 0; i < chunks.length; i++) {
     built += chunks[i];
     messageView.update(built, rawForCopy);
     if (i < chunks.length - 1) {
-      await new Promise((resolve) => setTimeout(resolve, built.length < 400 ? 16 : 8));
+      await new Promise((resolve) => setTimeout(resolve, built.length < 500 ? 14 : 7));
     }
   }
 }
 
 function summarizeToolUse(block) {
   const pretty = JSON.stringify(block.input ?? {}, null, 2);
-  return `Used tool: ${block.name}\n\nArguments:\n\n\
-\
-\
-json\n${pretty}\n\
-\
-\
-`;
+  return `Used tool: ${block.name}\n\n\`\`\`json\n${pretty}\n\`\`\``;
 }
 
 function responseToDisplay(response) {
@@ -142,9 +195,9 @@ function buildRequestPayload(userText) {
 
   return {
     model: 'local',
-    max_tokens: 1024,
+    max_tokens: 2048,
     system:
-      'You are Claw, an offline coding assistant. Use tools only when necessary. For ordinary conversation and code explanations, answer directly in normal text with clean markdown code blocks.',
+      'You are Claw, an offline coding assistant. Use tools only when necessary. Prefer clear, readable markdown with fenced code blocks. Keep code copy-friendly and well explained.',
     messages: transcript,
     stream: false,
   };
@@ -197,7 +250,7 @@ async function submitPrompt(event) {
     const assistantText = responseToDisplay(body) || 'No response text returned.';
     setActivity('Generating response…');
     pendingAssistant.card.classList.remove('pending');
-    await animateAssistantText(pendingAssistant, assistantText, JSON.stringify(body, null, 2));
+    await animateAssistantText(pendingAssistant, assistantText, assistantText);
     state.messages.push({ role: 'assistant', text: assistantText });
     setActivity('');
   } catch (error) {
@@ -239,6 +292,20 @@ insertTemplateButton.addEventListener('click', () => {
 
   promptEl.value = template;
   promptEl.focus();
+});
+
+wrapCodeCheckbox.addEventListener('change', () => {
+  state.wrapCode = wrapCodeCheckbox.checked;
+  for (const message of messagesEl.querySelectorAll('.message-body')) {
+    const raw = message.textContent || '';
+    // Re-render using the corresponding stored source when possible by rebuilding from card copy buffer.
+  }
+  // Re-render from state so code blocks pick up the new wrapping mode.
+  const saved = [...state.messages];
+  messagesEl.innerHTML = '';
+  for (const item of saved) {
+    appendMessage(item.role, item.text, item.text);
+  }
 });
 
 refreshHealth();
