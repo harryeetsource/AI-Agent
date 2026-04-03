@@ -197,7 +197,7 @@ function buildRequestPayload(userText) {
     model: 'local',
     max_tokens: 2048,
     system:
-      'You are Claw, an offline coding assistant. Use tools only when necessary. Prefer clear, readable markdown with fenced code blocks. Keep code copy-friendly and well explained.',
+      'You are Claw, an offline coding assistant. Prefer clear, readable markdown with fenced code blocks. Keep code copy-friendly and well explained. When the user asks to analyze a file, directory, crate, workspace, or source tree, analyze the actual provided local source context and filesystem structure if present. Do not answer with generic shell instructions when local source context has been supplied.',
     messages: transcript,
     stream: false,
   };
