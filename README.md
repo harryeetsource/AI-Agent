@@ -1,155 +1,179 @@
-# Claw Code (Offline Rewrite)
+# 🦞 Claw Code — Rust Implementation
 
-This fork is configured for **local-only model execution**.
-It no longer depends on Anthropic credentials or provider login flows.
+A high-performance Rust rewrite of the Claw Code CLI agent harness. Built for speed, safety, and native tool execution.
 
-## Offline architecture
-
-Claw now expects a **local Claw model daemon** that implements a native HTTP API:
-
-- `POST /v1/messages`
-- request body: `crates/api::types::MessageRequest`
-- response body: `crates/api::types::MessageResponse`
-
-By default, the CLI talks to:
+## Quick Start
 
 ```bash
-CLAW_LOCAL_BASE_URL=http://127.0.0.1:8080
+# Build
+cd rust/
+cargo build --release
+
+# Run interactive REPL
+./target/release/claw
+
+# One-shot prompt
+./target/release/claw prompt "explain this codebase"
+
+# With specific model
+./target/release/claw --model sonnet prompt "fix the bug in main.rs"
 ```
 
-The included `clawd` daemon is the local bridge you ship with Claw. It listens on `127.0.0.1:8080` by default and forwards Claw-native `MessageRequest` payloads to your local model runner.
+## Configuration
 
-## Included starter pieces
-
-- `crates/clawd/` — local native daemon
-- `data/schema.sql` — SQLite schema for `knowledge.db`
-- `data/corpus/` — starter corpus directories
-- `data/models/` — place GGUF model files here
-- `runners/llama/` — place `llama.cpp` binaries here
-- `scripts/init-knowledge-db.*` — initialize the SQLite DB
-- `scripts/run-llama.*` — start `llama-server`
-- `scripts/run-clawd.*` — start the Claw-native bridge daemon
-
-## What you need locally
-
-1. **A local model file**
-   - example: `data/models/qwen2.5-coder-1.5b-instruct-q4_k_m.gguf`
-
-2. **A local runner binary**
-   - example: `runners/llama/llama-server.exe`
-
-3. **A local retrieval database**
-   - example: `data/knowledge.db`
-
-4. **A local corpus directory**
-   - example: `data/corpus/`
-
-## Runner compatibility
-
-`llama.cpp` exposes an HTTP server that supports OpenAI-compatible routes and an **Anthropic Messages API compatible** route. That makes it a practical local backend for Claw while keeping Claw's external API native. citeturn749974search0turn749974search1
-
-The included `clawd` daemon forwards Claw requests to the runner at:
+Set your API credentials:
 
 ```bash
-CLAW_RUNNER_BASE_URL=http://127.0.0.1:8081
-CLAW_RUNNER_MESSAGES_PATH=/v1/messages
+export ANTHROPIC_API_KEY="sk-ant-..."
+# Or use a proxy
+export ANTHROPIC_BASE_URL="https://your-proxy.com"
 ```
 
-## Directory layout
+Or authenticate via OAuth:
 
-```text
+```bash
+claw login
+```
+
+
+## Optional local retrieval database (SQLite)
+
+If you use the offline/local retrieval workflow, install the `sqlite3` CLI first and make sure it is available in your system `PATH`.
+
+### Windows
+
+1. Download the SQLite tools bundle from the official SQLite download page.
+2. Extract `sqlite3.exe` to a stable directory such as `C:\\Tools\\sqlite`.
+3. Add that directory to your `PATH`.
+4. Verify installation:
+
+```powershell
+sqlite3 --version
+```
+
+### Linux
+
+```bash
+sudo apt install sqlite3
+```
+
+### macOS
+
+```bash
+brew install sqlite
+```
+
+Without `sqlite3`, local retrieval DB initialization and indexing will fail.
+
+## Features
+
+| Feature | Status |
+|---------|--------|
+| Anthropic API + streaming | ✅ |
+| OAuth login/logout | ✅ |
+| Interactive REPL (rustyline) | ✅ |
+| Tool system (bash, read, write, edit, grep, glob) | ✅ |
+| Web tools (search, fetch) | ✅ |
+| Sub-agent orchestration | ✅ |
+| Todo tracking | ✅ |
+| Notebook editing | ✅ |
+| CLAUDE.md / project memory | ✅ |
+| Config file hierarchy (.claude.json) | ✅ |
+| Permission system | ✅ |
+| MCP server lifecycle | ✅ |
+| Session persistence + resume | ✅ |
+| Extended thinking (thinking blocks) | ✅ |
+| Cost tracking + usage display | ✅ |
+| Git integration | ✅ |
+| Markdown terminal rendering (ANSI) | ✅ |
+| Model aliases (opus/sonnet/haiku) | ✅ |
+| Slash commands (/status, /compact, /clear, etc.) | ✅ |
+| Hooks (PreToolUse/PostToolUse) | 🔧 Config only |
+| Plugin system | 📋 Planned |
+| Skills registry | 📋 Planned |
+
+## Model Aliases
+
+Short names resolve to the latest model versions:
+
+| Alias | Resolves To |
+|-------|------------|
+| `opus` | `claude-opus-4-6` |
+| `sonnet` | `claude-sonnet-4-6` |
+| `haiku` | `claude-haiku-4-5-20251213` |
+
+## CLI Flags
+
+```
+claw [OPTIONS] [COMMAND]
+
+Options:
+  --model MODEL                    Set the model (alias or full name)
+  --dangerously-skip-permissions   Skip all permission checks
+  --permission-mode MODE           Set read-only, workspace-write, or danger-full-access
+  --allowedTools TOOLS             Restrict enabled tools
+  --output-format FORMAT           Output format (text or json)
+  --version, -V                    Print version info
+
+Commands:
+  prompt <text>      One-shot prompt (non-interactive)
+  login              Authenticate via OAuth
+  logout             Clear stored credentials
+  init               Initialize project config
+  doctor             Check environment health
+  self-update        Update to latest version
+```
+
+## Slash Commands (REPL)
+
+| Command | Description |
+|---------|-------------|
+| `/help` | Show help |
+| `/status` | Show session status (model, tokens, cost) |
+| `/cost` | Show cost breakdown |
+| `/compact` | Compact conversation history |
+| `/clear` | Clear conversation |
+| `/model [name]` | Show or switch model |
+| `/permissions` | Show or switch permission mode |
+| `/config [section]` | Show config (env, hooks, model) |
+| `/memory` | Show CLAUDE.md contents |
+| `/diff` | Show git diff |
+| `/export [path]` | Export conversation |
+| `/session [id]` | Resume a previous session |
+| `/version` | Show version |
+
+## Workspace Layout
+
+```
 rust/
-├── crates/
-│   └── clawd/
-├── data/
-│   ├── models/
-│   ├── corpus/
-│   ├── schema.sql
-│   └── knowledge.db
-├── runners/
-│   └── llama/
-├── scripts/
-│   ├── init-knowledge-db.ps1
-│   ├── init-knowledge-db.sh
-│   ├── run-llama.ps1
-│   ├── run-llama.sh
-│   ├── run-clawd.ps1
-│   └── run-clawd.sh
-└── .env.example
+├── Cargo.toml              # Workspace root
+├── Cargo.lock
+└── crates/
+    ├── api/                # Anthropic API client + SSE streaming
+    ├── commands/           # Shared slash-command registry
+    ├── compat-harness/     # TS manifest extraction harness
+    ├── runtime/            # Session, config, permissions, MCP, prompts
+    ├── rusty-claude-cli/   # Main CLI binary (`claw`)
+    └── tools/              # Built-in tool implementations
 ```
 
-## Minimal setup
+### Crate Responsibilities
 
-### 1. Put your model here
+- **api** — HTTP client, SSE stream parser, request/response types, auth (API key + OAuth bearer)
+- **commands** — Slash command definitions and help text generation
+- **compat-harness** — Extracts tool/prompt manifests from upstream TS source
+- **runtime** — `ConversationRuntime` agentic loop, `ConfigLoader` hierarchy, `Session` persistence, permission policy, MCP client, system prompt assembly, usage tracking
+- **rusty-claude-cli** — REPL, one-shot prompt, streaming display, tool call rendering, CLI argument parsing
+- **tools** — Tool specs + execution: Bash, ReadFile, WriteFile, EditFile, GlobSearch, GrepSearch, WebSearch, WebFetch, Agent, TodoWrite, NotebookEdit, Skill, ToolSearch, REPL runtimes
 
-```text
-data/models/qwen2.5-coder-1.5b-instruct-q4_k_m.gguf
-```
+## Stats
 
-### 2. Put your runner binaries here
+- **~20K lines** of Rust
+- **6 crates** in workspace
+- **Binary name:** `claw`
+- **Default model:** `claude-opus-4-6`
+- **Default permissions:** `danger-full-access`
 
-Windows:
+## License
 
-```text
-runners/llama/llama-server.exe
-runners/llama/llama-cli.exe
-```
-
-### 3. Initialize the database
-
-PowerShell:
-
-```powershell
-powershell -ep bypass .\scripts\init-knowledge-db.ps1
-```
-
-Bash:
-
-```bash
-./scripts/init-knowledge-db.sh
-```
-
-### 4. Start llama.cpp on port 8081
-
-PowerShell:
-
-```powershell
-powershell -ep bypass .\scriptsun-llama.ps1
-```
-
-Bash:
-
-```bash
-./scripts/run-llama.sh
-```
-
-### 5. Start the Claw-native daemon on port 8080
-
-PowerShell:
-
-```powershell
-powershell -ep bypass .\scriptsun-clawd.ps1
-```
-
-Bash:
-
-```bash
-./scripts/run-clawd.sh
-```
-
-### 6. Start the CLI
-
-```bash
-cargo run -p rusty-claude-cli --
-```
-
-Single-prompt mode:
-
-```bash
-cargo run -p rusty-claude-cli -- prompt "summarize this repo"
-```
-
-## Notes
-
-- The helper scripts now resolve paths relative to the repo, not the current shell directory.
-- `clawd` is intentionally small: it is the ship-ready local bridge, while `llama.cpp` remains the inference engine and `knowledge.db` remains the retrieval layer.
+See repository root.

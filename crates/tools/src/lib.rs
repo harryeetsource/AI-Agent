@@ -4,7 +4,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use api::{
-    read_base_url, ContentBlockDelta, InputContentBlock, InputMessage, LocalModelClient,
+    read_base_url, AnthropicClient, ContentBlockDelta, InputContentBlock, InputMessage,
     MessageRequest, MessageResponse, OutputContentBlock, StreamEvent as ApiStreamEvent, ToolChoice,
     ToolDefinition, ToolResultContentBlock,
 };
@@ -1570,7 +1570,7 @@ fn resolve_skill_path(skill: &str) -> Result<std::path::PathBuf, String> {
     Err(format!("unknown skill: {requested}"))
 }
 
-const DEFAULT_AGENT_MODEL: &str = "qwen2.5-coder:7b";
+const DEFAULT_AGENT_MODEL: &str = "claude-opus-4-6";
 const DEFAULT_AGENT_SYSTEM_DATE: &str = "2026-03-31";
 const DEFAULT_AGENT_MAX_ITERATIONS: usize = 32;
 
@@ -1693,7 +1693,7 @@ fn run_agent_job(job: &AgentJob) -> Result<(), String> {
 
 fn build_agent_runtime(
     job: &AgentJob,
-) -> Result<ConversationRuntime<LocalRuntimeClient, SubagentToolExecutor>, String> {
+) -> Result<ConversationRuntime<AnthropicRuntimeClient, SubagentToolExecutor>, String> {
     let model = job
         .manifest
         .model
@@ -1702,7 +1702,7 @@ fn build_agent_runtime(
     let allowed_tools = job.allowed_tools.clone();
     let tool_registry = current_tool_registry()?;
     let api_client =
-        LocalRuntimeClient::new(model, allowed_tools.clone(), tool_registry.clone())?;
+        AnthropicRuntimeClient::new(model, allowed_tools.clone(), tool_registry.clone())?;
     let tool_executor = SubagentToolExecutor::new(allowed_tools, tool_registry.clone());
     Ok(ConversationRuntime::new(
         Session::new(),
@@ -1873,21 +1873,21 @@ fn format_agent_terminal_output(status: &str, result: Option<&str>, error: Optio
     sections.join("")
 }
 
-struct LocalRuntimeClient {
+struct AnthropicRuntimeClient {
     runtime: tokio::runtime::Runtime,
-    client: LocalModelClient,
+    client: AnthropicClient,
     model: String,
     allowed_tools: BTreeSet<String>,
     tool_registry: GlobalToolRegistry,
 }
 
-impl LocalRuntimeClient {
+impl AnthropicRuntimeClient {
     fn new(
         model: String,
         allowed_tools: BTreeSet<String>,
         tool_registry: GlobalToolRegistry,
     ) -> Result<Self, String> {
-        let client = LocalModelClient::from_env()
+        let client = AnthropicClient::from_env()
             .map_err(|error| error.to_string())?
             .with_base_url(read_base_url());
         Ok(Self {
@@ -1900,7 +1900,7 @@ impl LocalRuntimeClient {
     }
 }
 
-impl ApiClient for LocalRuntimeClient {
+impl ApiClient for AnthropicRuntimeClient {
     fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
         let tools = self.tool_registry.definitions(Some(&self.allowed_tools));
         let message_request = MessageRequest {

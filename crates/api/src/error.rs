@@ -54,7 +54,7 @@ impl Display for ApiError {
             Self::MissingApiKey => {
                 write!(
                     f,
-                    "local model backend is not configured correctly"
+                    "ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY is not set; export one before calling the Anthropic API"
                 )
             }
             Self::ExpiredOAuthToken => {
@@ -67,7 +67,7 @@ impl Display for ApiError {
             Self::InvalidApiKeyEnv(error) => {
                 write!(
                     f,
-                    "failed to read local backend configuration: {error}"
+                    "failed to read ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY: {error}"
                 )
             }
             Self::Http(error) => write!(f, "http error: {error}"),
@@ -83,17 +83,17 @@ impl Display for ApiError {
                 (Some(error_type), Some(message)) => {
                     write!(
                         f,
-                        "local model backend returned {status} ({error_type}): {message}"
+                        "anthropic api returned {status} ({error_type}): {message}"
                     )
                 }
-                _ => write!(f, "local model backend returned {status}: {body}"),
+                _ => write!(f, "anthropic api returned {status}: {body}"),
             },
             Self::RetriesExhausted {
                 attempts,
                 last_error,
             } => write!(
                 f,
-                "local model backend failed after {attempts} attempts: {last_error}"
+                "anthropic api failed after {attempts} attempts: {last_error}"
             ),
             Self::InvalidSseFrame(message) => write!(f, "invalid sse frame: {message}"),
             Self::BackoffOverflow {

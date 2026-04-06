@@ -44,13 +44,11 @@ impl Default for ColorTheme {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Spinner {
     frame_index: usize,
 }
 
-#[allow(dead_code)]
 impl Spinner {
     const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -245,7 +243,6 @@ impl TerminalRenderer {
     }
 
     #[must_use]
-    #[allow(dead_code)]
     pub fn color_theme(&self) -> &ColorTheme {
         &self.color_theme
     }

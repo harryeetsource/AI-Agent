@@ -3,9 +3,13 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Clone, Parser, PartialEq, Eq)]
-#[command(name = "rusty-claude-cli", version, about = "Rust Claw CLI prototype")]
+#[command(
+    name = "rusty-claude-cli",
+    version,
+    about = "Rust Claude CLI prototype"
+)]
 pub struct Cli {
-    #[arg(long, default_value = "qwen2.5-coder:7b")]
+    #[arg(long, default_value = "claude-opus-4-6")]
     pub model: String,
 
     #[arg(long, value_enum, default_value_t = PermissionMode::DangerFullAccess)]
@@ -27,6 +31,10 @@ pub enum Command {
     DumpManifests,
     /// Print the current bootstrap phase skeleton
     BootstrapPlan,
+    /// Start the OAuth login flow
+    Login,
+    /// Clear saved OAuth credentials
+    Logout,
     /// Run a non-interactive prompt and exit
     Prompt { prompt: Vec<String> },
 }
@@ -56,7 +64,7 @@ mod tests {
         let cli = Cli::parse_from([
             "rusty-claude-cli",
             "--model",
-            "qwen2.5-coder:14b",
+            "claude-3-5-haiku",
             "--permission-mode",
             "read-only",
             "--config",
@@ -68,7 +76,7 @@ mod tests {
             "world",
         ]);
 
-        assert_eq!(cli.model, "qwen2.5-coder:14b");
+        assert_eq!(cli.model, "claude-3-5-haiku");
         assert_eq!(cli.permission_mode, PermissionMode::ReadOnly);
         assert_eq!(
             cli.config.as_deref(),
@@ -81,6 +89,15 @@ mod tests {
                 prompt: vec!["hello".into(), "world".into()]
             })
         );
+    }
+
+    #[test]
+    fn parses_login_and_logout_commands() {
+        let login = Cli::parse_from(["rusty-claude-cli", "login"]);
+        assert_eq!(login.command, Some(Command::Login));
+
+        let logout = Cli::parse_from(["rusty-claude-cli", "logout"]);
+        assert_eq!(logout.command, Some(Command::Logout));
     }
 
     #[test]

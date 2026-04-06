@@ -9,6 +9,7 @@ mod json;
 mod mcp;
 mod mcp_client;
 mod mcp_stdio;
+mod oauth;
 mod permissions;
 mod prompt;
 mod remote;
@@ -57,6 +58,13 @@ pub use mcp_stdio::{
     McpListToolsResult, McpReadResourceParams, McpReadResourceResult, McpResource,
     McpResourceContents, McpServerManager, McpServerManagerError, McpStdioProcess, McpTool,
     McpToolCallContent, McpToolCallParams, McpToolCallResult, UnsupportedMcpServer,
+};
+pub use oauth::{
+    clear_oauth_credentials, code_challenge_s256, credentials_path, generate_pkce_pair,
+    generate_state, load_oauth_credentials, loopback_redirect_uri, parse_oauth_callback_query,
+    parse_oauth_callback_request_target, save_oauth_credentials, OAuthAuthorizationRequest,
+    OAuthCallbackParams, OAuthRefreshRequest, OAuthTokenExchangeRequest, OAuthTokenSet,
+    PkceChallengeMethod, PkceCodePair,
 };
 pub use permissions::{
     PermissionContext, PermissionMode, PermissionOutcome, PermissionOverride, PermissionPolicy,

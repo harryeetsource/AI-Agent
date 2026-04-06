@@ -6,7 +6,8 @@ use std::collections::BTreeSet;
 use std::env;
 use std::fmt::Write as _;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
@@ -15,9 +16,9 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use api::{
-    ContentBlockDelta, InputContentBlock, InputMessage, LocalModelClient, MessageRequest,
-    MessageResponse, OutputContentBlock, StreamEvent as ApiStreamEvent,
-    ToolChoice, ToolDefinition, ToolResultContentBlock,
+    resolve_startup_auth_source, AnthropicClient, AuthSource, ContentBlockDelta, InputContentBlock,
+    InputMessage, MessageRequest, MessageResponse, OutputContentBlock,
+    StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
 };
 
 use commands::{
@@ -27,17 +28,19 @@ use commands::{
 use compat_harness::{extract_manifest, UpstreamPaths};
 use init::initialize_repo;
 use plugins::{PluginManager, PluginManagerConfig, PluginRegistry};
-use render::{MarkdownStreamState, TerminalRenderer};
+use render::{MarkdownStreamState, Spinner, TerminalRenderer};
 use runtime::{
-    ApiClient, ApiRequest, AssistantEvent, CompactionConfig, ConfigLoader, ConfigSource,
-    ContentBlock, ConversationMessage, ConversationRuntime, MessageRole, PermissionMode,
-    PermissionPolicy, ProjectContext, RuntimeError, Session, TokenUsage, ToolError, ToolExecutor,
-    UsageTracker, load_system_prompt,
+    clear_oauth_credentials, generate_pkce_pair, generate_state, load_system_prompt,
+    parse_oauth_callback_request_target, save_oauth_credentials, ApiClient, ApiRequest,
+    AssistantEvent, CompactionConfig, ConfigLoader, ConfigSource, ContentBlock,
+    ConversationMessage, ConversationRuntime, MessageRole, OAuthAuthorizationRequest, OAuthConfig,
+    OAuthTokenExchangeRequest, PermissionMode, PermissionPolicy, ProjectContext, RuntimeError,
+    Session, TokenUsage, ToolError, ToolExecutor, UsageTracker,
 };
 use serde_json::json;
 use tools::GlobalToolRegistry;
 
-const DEFAULT_MODEL: &str = "qwen2.5-coder:7b";
+const DEFAULT_MODEL: &str = "claude-opus-4-6";
 fn max_tokens_for_model(model: &str) -> u32 {
     if model.contains("opus") {
         32_000
@@ -46,6 +49,7 @@ fn max_tokens_for_model(model: &str) -> u32 {
     }
 }
 const DEFAULT_DATE: &str = "2026-03-31";
+const DEFAULT_OAUTH_CALLBACK_PORT: u16 = 4545;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const BUILD_TARGET: Option<&str> = option_env!("TARGET");
 const GIT_SHA: Option<&str> = option_env!("GIT_SHA");
@@ -83,6 +87,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             permission_mode,
         } => LiveCli::new(model, true, allowed_tools, permission_mode)?
             .run_turn_with_output(&prompt, output_format)?,
+        CliAction::Login => run_login()?,
+        CliAction::Logout => run_logout()?,
         CliAction::Init => run_init()?,
         CliAction::Repl {
             model,
@@ -114,6 +120,8 @@ enum CliAction {
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
     },
+    Login,
+    Logout,
     Init,
     Repl {
         model: String,
@@ -260,6 +268,8 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         "dump-manifests" => Ok(CliAction::DumpManifests),
         "bootstrap-plan" => Ok(CliAction::BootstrapPlan),
         "system-prompt" => parse_system_prompt_args(&rest[1..]),
+        "login" => Ok(CliAction::Login),
+        "logout" => Ok(CliAction::Logout),
         "init" => Ok(CliAction::Init),
         "prompt" => {
             let prompt = rest[1..].join(" ");
@@ -287,9 +297,9 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
 
 fn resolve_model_alias(model: &str) -> &str {
     match model {
-        "opus" => "qwen2.5-coder:32b",
-        "sonnet" => "qwen2.5-coder:14b",
-        "haiku" => "qwen2.5-coder:7b",
+        "opus" => "claude-opus-4-6",
+        "sonnet" => "claude-sonnet-4-6",
+        "haiku" => "claude-haiku-4-5-20251213",
         _ => model,
     }
 }
@@ -340,11 +350,7 @@ fn filter_tool_specs(
     tool_registry: &GlobalToolRegistry,
     allowed_tools: Option<&AllowedToolSet>,
 ) -> Vec<ToolDefinition> {
-    let mut definitions = tool_registry.definitions(allowed_tools);
-    definitions.retain(|tool| {
-        !matches!(tool.name.as_str(), "SendUserMessage" | "ToolSearch")
-    });
-    definitions
+    tool_registry.definitions(allowed_tools)
 }
 
 fn parse_system_prompt_args(args: &[String]) -> Result<CliAction, String> {
@@ -415,6 +421,132 @@ fn print_bootstrap_plan() {
     }
 }
 
+fn default_oauth_config() -> OAuthConfig {
+    OAuthConfig {
+        client_id: String::from("9d1c250a-e61b-44d9-88ed-5944d1962f5e"),
+        authorize_url: String::from("https://platform.claude.com/oauth/authorize"),
+        token_url: String::from("https://platform.claude.com/v1/oauth/token"),
+        callback_port: None,
+        manual_redirect_url: None,
+        scopes: vec![
+            String::from("user:profile"),
+            String::from("user:inference"),
+            String::from("user:sessions:claude_code"),
+        ],
+    }
+}
+
+fn run_login() -> Result<(), Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    let config = ConfigLoader::default_for(&cwd).load()?;
+    let default_oauth = default_oauth_config();
+    let oauth = config.oauth().unwrap_or(&default_oauth);
+    let callback_port = oauth.callback_port.unwrap_or(DEFAULT_OAUTH_CALLBACK_PORT);
+    let redirect_uri = runtime::loopback_redirect_uri(callback_port);
+    let pkce = generate_pkce_pair()?;
+    let state = generate_state()?;
+    let authorize_url =
+        OAuthAuthorizationRequest::from_config(oauth, redirect_uri.clone(), state.clone(), &pkce)
+            .build_url();
+
+    println!("Starting Claude OAuth login...");
+    println!("Listening for callback on {redirect_uri}");
+    if let Err(error) = open_browser(&authorize_url) {
+        eprintln!("warning: failed to open browser automatically: {error}");
+        println!("Open this URL manually:\n{authorize_url}");
+    }
+
+    let callback = wait_for_oauth_callback(callback_port)?;
+    if let Some(error) = callback.error {
+        let description = callback
+            .error_description
+            .unwrap_or_else(|| "authorization failed".to_string());
+        return Err(io::Error::other(format!("{error}: {description}")).into());
+    }
+    let code = callback.code.ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "callback did not include code")
+    })?;
+    let returned_state = callback.state.ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "callback did not include state")
+    })?;
+    if returned_state != state {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "oauth state mismatch").into());
+    }
+
+    let client = AnthropicClient::from_auth(AuthSource::None).with_base_url(api::read_base_url());
+    let exchange_request =
+        OAuthTokenExchangeRequest::from_config(oauth, code, state, pkce.verifier, redirect_uri);
+    let runtime = tokio::runtime::Runtime::new()?;
+    let token_set = runtime.block_on(client.exchange_oauth_code(oauth, &exchange_request))?;
+    save_oauth_credentials(&runtime::OAuthTokenSet {
+        access_token: token_set.access_token,
+        refresh_token: token_set.refresh_token,
+        expires_at: token_set.expires_at,
+        scopes: token_set.scopes,
+    })?;
+    println!("Claude OAuth login complete.");
+    Ok(())
+}
+
+fn run_logout() -> Result<(), Box<dyn std::error::Error>> {
+    clear_oauth_credentials()?;
+    println!("Claude OAuth credentials cleared.");
+    Ok(())
+}
+
+fn open_browser(url: &str) -> io::Result<()> {
+    let commands = if cfg!(target_os = "macos") {
+        vec![("open", vec![url])]
+    } else if cfg!(target_os = "windows") {
+        vec![("cmd", vec!["/C", "start", "", url])]
+    } else {
+        vec![("xdg-open", vec![url])]
+    };
+    for (program, args) in commands {
+        match Command::new(program).args(args).spawn() {
+            Ok(_) => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        "no supported browser opener command found",
+    ))
+}
+
+fn wait_for_oauth_callback(
+    port: u16,
+) -> Result<runtime::OAuthCallbackParams, Box<dyn std::error::Error>> {
+    let listener = TcpListener::bind(("127.0.0.1", port))?;
+    let (mut stream, _) = listener.accept()?;
+    let mut buffer = [0_u8; 4096];
+    let bytes_read = stream.read(&mut buffer)?;
+    let request = String::from_utf8_lossy(&buffer[..bytes_read]);
+    let request_line = request.lines().next().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "missing callback request line")
+    })?;
+    let target = request_line.split_whitespace().nth(1).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "missing callback request target",
+        )
+    })?;
+    let callback = parse_oauth_callback_request_target(target)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let body = if callback.error.is_some() {
+        "Claude OAuth login failed. You can close this window."
+    } else {
+        "Claude OAuth login succeeded. You can close this window."
+    };
+    let response = format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: text/plain; charset=utf-8\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    stream.write_all(response.as_bytes())?;
+    Ok(callback)
+}
 
 fn print_system_prompt(cwd: PathBuf, date: String) {
     match load_system_prompt(cwd, date, env::consts::OS, "unknown") {
@@ -836,7 +968,7 @@ struct LiveCli {
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
     system_prompt: Vec<String>,
-    runtime: ConversationRuntime<LocalRuntimeClient, CliToolExecutor>,
+    runtime: ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>,
     session: SessionHandle,
 }
 
@@ -956,7 +1088,7 @@ impl LiveCli {
         emit_output: bool,
     ) -> Result<
         (
-            ConversationRuntime<LocalRuntimeClient, CliToolExecutor>,
+            ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>,
             HookAbortMonitor,
         ),
         Box<dyn std::error::Error>,
@@ -980,12 +1112,24 @@ impl LiveCli {
 
     fn run_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
         let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(true)?;
+        let mut spinner = Spinner::new();
+        let mut stdout = io::stdout();
+        spinner.tick(
+            "🦀 Thinking...",
+            TerminalRenderer::new().color_theme(),
+            &mut stdout,
+        )?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
         let result = runtime.run_turn(input, Some(&mut permission_prompter));
         hook_abort_monitor.stop();
         self.runtime = runtime;
         match result {
             Ok(summary) => {
+                spinner.finish(
+                    "✨ Done",
+                    TerminalRenderer::new().color_theme(),
+                    &mut stdout,
+                )?;
                 println!();
                 if let Some(event) = summary.auto_compaction {
                     println!(
@@ -997,7 +1141,11 @@ impl LiveCli {
                 Ok(())
             }
             Err(error) => {
-                eprintln!("✘ ❌ Request failed");
+                spinner.fail(
+                    "❌ Request failed",
+                    TerminalRenderer::new().color_theme(),
+                    &mut stdout,
+                )?;
                 Err(Box::new(error))
             }
         }
@@ -2279,25 +2427,12 @@ fn resolve_export_path(
 }
 
 fn build_system_prompt() -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    let mut prompt = load_system_prompt(
+    Ok(load_system_prompt(
         env::current_dir()?,
         DEFAULT_DATE,
         env::consts::OS,
         "unknown",
-    )?;
-    prompt.push(
-        [
-            "# Tool use policy",
-            "- Use tools only when they materially help complete the user's request.",
-            "- Do not call tools for simple greetings, conversational replies, explanations, brainstorming, or questions that can be answered directly from existing context.",
-            "- Before using a tool, prefer to answer directly when no external action, file access, search, or state change is needed.",
-            "- When a tool is genuinely needed, choose the smallest relevant tool action and then continue with a normal natural-language answer after the tool result.",
-            "- Do not emit raw tool JSON to the user outside structured tool-use blocks.",
-        ]
-        .join("
-"),
-    );
-    Ok(prompt)
+    )?)
 }
 
 fn build_runtime_plugin_state() -> Result<
@@ -2695,12 +2830,12 @@ fn build_runtime(
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
     progress_reporter: Option<InternalPromptProgressReporter>,
-) -> Result<ConversationRuntime<LocalRuntimeClient, CliToolExecutor>, Box<dyn std::error::Error>>
+) -> Result<ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>, Box<dyn std::error::Error>>
 {
     let (feature_config, plugin_registry, tool_registry) = build_runtime_plugin_state()?;
     let mut runtime = ConversationRuntime::new_with_plugins(
         session,
-        LocalRuntimeClient::new(
+        AnthropicRuntimeClient::new(
             model,
             enable_tools,
             emit_output,
@@ -2799,9 +2934,9 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
     }
 }
 
-struct LocalRuntimeClient {
+struct AnthropicRuntimeClient {
     runtime: tokio::runtime::Runtime,
-    client: LocalModelClient,
+    client: AnthropicClient,
     model: String,
     enable_tools: bool,
     emit_output: bool,
@@ -2810,7 +2945,7 @@ struct LocalRuntimeClient {
     progress_reporter: Option<InternalPromptProgressReporter>,
 }
 
-impl LocalRuntimeClient {
+impl AnthropicRuntimeClient {
     fn new(
         model: String,
         enable_tools: bool,
@@ -2821,7 +2956,8 @@ impl LocalRuntimeClient {
     ) -> Result<Self, Box<dyn std::error::Error>> {
         Ok(Self {
             runtime: tokio::runtime::Runtime::new()?,
-            client: LocalModelClient::new().with_base_url(api::read_base_url()),
+            client: AnthropicClient::from_auth(resolve_cli_auth_source()?)
+                .with_base_url(api::read_base_url()),
             model,
             enable_tools,
             emit_output,
@@ -2832,27 +2968,111 @@ impl LocalRuntimeClient {
     }
 }
 
-impl ApiClient for LocalRuntimeClient {
+fn resolve_cli_auth_source() -> Result<AuthSource, Box<dyn std::error::Error>> {
+    Ok(resolve_startup_auth_source(|| {
+        let cwd = env::current_dir().map_err(api::ApiError::from)?;
+        let config = ConfigLoader::default_for(&cwd).load().map_err(|error| {
+            api::ApiError::Auth(format!("failed to load runtime OAuth config: {error}"))
+        })?;
+        Ok(config.oauth().cloned())
+    })?)
+}
+
+fn latest_user_text(messages: &[ConversationMessage]) -> Option<String> {
+    messages
+        .iter()
+        .rev()
+        .find(|message| matches!(message.role, MessageRole::User))
+        .map(|message| {
+            message
+                .blocks
+                .iter()
+                .filter_map(|block| match block {
+                    ContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .filter(|text| !text.trim().is_empty())
+}
+
+fn detect_existing_paths(text: &str) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for raw in text.split_whitespace() {
+        let trimmed = raw.trim_matches(|ch: char| matches!(ch, '"' | ''' | '`' | ',' | ';' | ':' | '(' | ')' | '[' | ']' | '{' | '}' ));
+        if trimmed.is_empty() {
+            continue;
+        }
+        let candidates = [trimmed, trimmed.strip_suffix('.').unwrap_or(trimmed)];
+        for cand in candidates {
+            if cand.is_empty() { continue; }
+            let path = PathBuf::from(cand);
+            let resolved = if path.is_absolute() { path } else { std::env::current_dir().ok().map(|cwd| cwd.join(cand)).unwrap_or_else(|| PathBuf::from(cand)) };
+            if resolved.exists() {
+                let key = resolved.to_string_lossy().to_string();
+                if seen.insert(key) {
+                    out.push(resolved);
+                }
+                break;
+            }
+        }
+    }
+    out
+}
+
+fn local_analysis_system_hint(messages: &[ConversationMessage]) -> Option<String> {
+    let user_text = latest_user_text(messages)?;
+    let paths = detect_existing_paths(&user_text);
+    if paths.is_empty() {
+        return None;
+    }
+
+    let mut lines = vec![
+        "# Local path analysis mode".to_string(),
+        "The latest user message references one or more REAL local filesystem paths that exist in the current workspace or on disk.".to_string(),
+        "Do NOT give the user generic steps or shell commands for how they could inspect the code themselves unless they explicitly ask for commands.".to_string(),
+        "Instead, use the available tools to inspect the path yourself and then provide the analysis.".to_string(),
+        "For directories: use glob_search to discover relevant files, then read_file and grep_search to inspect the real source.".to_string(),
+        "For files: use read_file directly, and use grep_search only if more context is needed.".to_string(),
+        "Base your answer only on files you actually inspected. Explicitly name the files you read. If coverage is partial, say what you inspected and what should be read next.".to_string(),
+        "Prioritize Cargo.toml, src/main.rs, src/lib.rs, mod.rs, query-relevant files, and files containing unsafe, impl, pub fn, trait, struct, or enum definitions.".to_string(),
+        "Do not claim that the source code was not provided when you have access to it through tools.".to_string(),
+        "Referenced existing paths:".to_string(),
+    ];
+    for path in paths {
+        lines.push(format!("- {}", path.display()));
+    }
+    Some(lines.join("\n"))
+}
+
+fn augment_system_prompt_for_local_analysis(request: &ApiRequest) -> Vec<String> {
+    let mut prompt = request.system_prompt.clone();
+    if let Some(extra) = local_analysis_system_hint(&request.messages) {
+        prompt.push(extra);
+    }
+    prompt
+}
+
+impl ApiClient for AnthropicRuntimeClient {
     #[allow(clippy::too_many_lines)]
     fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
         if let Some(progress_reporter) = &self.progress_reporter {
             progress_reporter.mark_model_phase();
         }
-        let tools = if self.enable_tools {
-            filter_tool_specs(&self.tool_registry, self.allowed_tools.as_ref())
-        } else {
-            Vec::new()
-        };
-        let has_tools = !tools.is_empty();
         let message_request = MessageRequest {
             model: self.model.clone(),
             max_tokens: max_tokens_for_model(&self.model),
             messages: convert_messages(&request.messages),
-            system: (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("
-
-")),
-            tools: has_tools.then_some(tools),
-            tool_choice: has_tools.then_some(ToolChoice::Auto),
+            system: {
+                let prompt = augment_system_prompt_for_local_analysis(&request);
+                (!prompt.is_empty()).then(|| prompt.join("\n\n"))
+            },
+            tools: self
+                .enable_tools
+                .then(|| filter_tool_specs(&self.tool_registry, self.allowed_tools.as_ref())),
+            tool_choice: self.enable_tools.then_some(ToolChoice::Auto),
             stream: true,
         };
 
@@ -3090,58 +3310,6 @@ fn format_tool_call_start(name: &str, input: &str) -> String {
             .and_then(|value| value.as_str())
             .unwrap_or("?")
             .to_string(),
-        "WebFetch" => {
-            let url = parsed
-                .get("url")
-                .and_then(|value| value.as_str())
-                .unwrap_or("?");
-            let prompt = parsed
-                .get("prompt")
-                .and_then(|value| value.as_str())
-                .map(|value| truncate_for_summary(value, 120))
-                .unwrap_or_default();
-            if prompt.is_empty() {
-                format!("🌐 Fetching {url}")
-            } else {
-                format!("🌐 Fetching {url}
-[2mReason: {prompt}[0m")
-            }
-        }
-        "TodoWrite" => {
-            let todos = parsed
-                .get("todos")
-                .and_then(|value| value.as_array())
-                .cloned()
-                .unwrap_or_default();
-            if todos.is_empty() {
-                "🗒️ Updating todo list".to_string()
-            } else {
-                let preview = todos
-                    .iter()
-                    .take(4)
-                    .filter_map(|todo| todo.get("content").and_then(|value| value.as_str()))
-                    .map(|todo| format!("• {todo}"))
-                    .collect::<Vec<_>>()
-                    .join("
-");
-                let suffix = if todos.len() > 4 { "
-[2m…more todos omitted[0m" } else { "" };
-                format!("🗒️ Updating {} todo{}
-{}{}", todos.len(), if todos.len() == 1 { "" } else { "s" }, preview, suffix)
-            }
-        }
-        "SendUserMessage" => parsed
-            .get("message")
-            .and_then(|value| value.as_str())
-            .map(|message| format!("💬 Replying to you
-[2m{}[0m", truncate_for_summary(message, 120)))
-            .unwrap_or_else(|| "💬 Replying to you".to_string()),
-        "ToolSearch" => parsed
-            .get("query")
-            .and_then(|value| value.as_str())
-            .map(|query| format!("🧰 Looking for a relevant tool
-[2mQuery: {}[0m", truncate_for_summary(query, 120)))
-            .unwrap_or_else(|| "🧰 Looking for a relevant tool".to_string()),
         _ => summarize_tool_payload(input),
     };
 
@@ -3175,37 +3343,6 @@ fn format_tool_result(name: &str, output: &str, is_error: bool) -> String {
         "edit_file" | "Edit" => format_edit_result(icon, &parsed),
         "glob_search" | "Glob" => format_glob_result(icon, &parsed),
         "grep_search" | "Grep" => format_grep_result(icon, &parsed),
-        "WebFetch" => format_generic_tool_result(icon, "web fetch", &parsed),
-        "TodoWrite" => {
-            let count = parsed
-                .get("todos")
-                .and_then(|value| value.as_array())
-                .map_or(0, |todos| todos.len());
-            if count == 0 {
-                format!("{icon} todo list updated")
-            } else {
-                format!("{icon} updated {count} todo{}", if count == 1 { "" } else { "s" })
-            }
-        }
-        "SendUserMessage" => parsed
-            .get("message")
-            .and_then(|value| value.as_str())
-            .map(|message| message.to_string())
-            .unwrap_or_else(|| format!("{icon} replied to user")),
-        "ToolSearch" => {
-            let matches = parsed
-                .get("matches")
-                .and_then(|value| value.as_array())
-                .cloned()
-                .unwrap_or_default();
-            if matches.is_empty() {
-                format!("{icon} no matching tools found")
-            } else {
-                let preview = matches.iter().take(5).filter_map(|v| v.as_str()).collect::<Vec<_>>().join(", ");
-                let suffix = if matches.len() > 5 { ", …" } else { "" };
-                format!("{icon} found {} tool{}: {}{}", matches.len(), if matches.len() == 1 { "" } else { "s" }, preview, suffix)
-            }
-        }
         _ => format_generic_tool_result(icon, name, &parsed),
     }
 }
@@ -3762,6 +3899,8 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "  claw dump-manifests")?;
     writeln!(out, "  claw bootstrap-plan")?;
     writeln!(out, "  claw system-prompt [--cwd PATH] [--date YYYY-MM-DD]")?;
+    writeln!(out, "  claw login")?;
+    writeln!(out, "  claw logout")?;
     writeln!(out, "  claw init")?;
     writeln!(out)?;
     writeln!(out, "Flags:")?;
@@ -3813,6 +3952,7 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         out,
         "  claw --resume session.json /status /diff /export notes.txt"
     )?;
+    writeln!(out, "  claw login")?;
     writeln!(out, "  claw init")?;
     Ok(())
 }
@@ -3906,7 +4046,7 @@ mod tests {
         let args = vec![
             "--output-format=json".to_string(),
             "--model".to_string(),
-            "qwen2.5-coder:32b".to_string(),
+            "claude-opus".to_string(),
             "explain".to_string(),
             "this".to_string(),
         ];
@@ -3914,7 +4054,7 @@ mod tests {
             parse_args(&args).expect("args should parse"),
             CliAction::Prompt {
                 prompt: "explain this".to_string(),
-                model: "qwen2.5-coder:32b".to_string(),
+                model: "claude-opus".to_string(),
                 output_format: CliOutputFormat::Json,
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
@@ -3934,7 +4074,7 @@ mod tests {
             parse_args(&args).expect("args should parse"),
             CliAction::Prompt {
                 prompt: "explain this".to_string(),
-                model: "qwen2.5-coder:7b".to_string(),
+                model: "claude-opus-4-6".to_string(),
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
@@ -3944,10 +4084,10 @@ mod tests {
 
     #[test]
     fn resolves_known_model_aliases() {
-        assert_eq!(resolve_model_alias("opus"), "qwen2.5-coder:32b");
-        assert_eq!(resolve_model_alias("sonnet"), "qwen2.5-coder:14b");
-        assert_eq!(resolve_model_alias("haiku"), "qwen2.5-coder:7b");
-        assert_eq!(resolve_model_alias("custom-model"), "custom-model");
+        assert_eq!(resolve_model_alias("opus"), "claude-opus-4-6");
+        assert_eq!(resolve_model_alias("sonnet"), "claude-sonnet-4-6");
+        assert_eq!(resolve_model_alias("haiku"), "claude-haiku-4-5-20251213");
+        assert_eq!(resolve_model_alias("claude-opus"), "claude-opus");
     }
 
     #[test]
@@ -4019,6 +4159,22 @@ mod tests {
                 cwd: PathBuf::from("/tmp/project"),
                 date: "2026-04-01".to_string(),
             }
+        );
+    }
+
+    #[test]
+    fn parses_login_and_logout_subcommands() {
+        assert_eq!(
+            parse_args(&["login".to_string()]).expect("login should parse"),
+            CliAction::Login
+        );
+        assert_eq!(
+            parse_args(&["logout".to_string()]).expect("logout should parse"),
+            CliAction::Logout
+        );
+        assert_eq!(
+            parse_args(&["init".to_string()]).expect("init should parse"),
+            CliAction::Init
         );
     }
 
@@ -4627,7 +4783,7 @@ mod tests {
             MessageResponse {
                 id: "msg-1".to_string(),
                 kind: "message".to_string(),
-                model: "qwen2.5-coder:7b".to_string(),
+                model: "claude-opus-4-6".to_string(),
                 role: "assistant".to_string(),
                 content: vec![OutputContentBlock::ToolUse {
                     id: "tool-1".to_string(),
@@ -4662,7 +4818,7 @@ mod tests {
             MessageResponse {
                 id: "msg-2".to_string(),
                 kind: "message".to_string(),
-                model: "qwen2.5-coder:7b".to_string(),
+                model: "claude-opus-4-6".to_string(),
                 role: "assistant".to_string(),
                 content: vec![OutputContentBlock::ToolUse {
                     id: "tool-2".to_string(),
@@ -4697,7 +4853,7 @@ mod tests {
             MessageResponse {
                 id: "msg-3".to_string(),
                 kind: "message".to_string(),
-                model: "qwen2.5-coder:7b".to_string(),
+                model: "claude-opus-4-6".to_string(),
                 role: "assistant".to_string(),
                 content: vec![
                     OutputContentBlock::Thinking {
