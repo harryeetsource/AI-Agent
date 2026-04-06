@@ -1,7 +1,7 @@
 param(
-    [string]$ModelPath = ".\data\models\qwen2.5-coder-1.5b-instruct-q4_k_m.gguf",
+    [string]$ModelPath = ".\data\models\model.gguf",
     [string]$ServerPath = ".\runners\llama\llama-server.exe",
-    [string]$Host = "127.0.0.1",
+    [string]$BindHost = "127.0.0.1",
     [int]$Port = 8081,
     [int]$Context = 8192,
     [int]$Threads = 0
@@ -19,7 +19,7 @@ if (-not (Test-Path $ModelPath)) {
 
 $arguments = @(
     "-m", $ModelPath,
-    "--host", $Host,
+    "--host", $BindHost,
     "--port", $Port,
     "-c", $Context
 )
