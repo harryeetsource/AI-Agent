@@ -1,55 +1,79 @@
 # 🦞 Claw Code — Rust Implementation
 
-A high-performance Rust rewrite of the Claw Code CLI agent harness. Built for speed, safety, and native tool execution.
+A high-performance Rust implementation of the **Claw autonomous code analysis agent**.
 
-## Quick Start
+Claw performs **deep structural analysis of real source code projects** using native Rust tooling.  
+It runs fully locally and directly invokes tools from the workspace to inspect files, discover relationships, and produce architectural insights.
+
+No external API providers are required.
+
+---
+
+# Quick Start
 
 ```bash
-# Build
+# build
 cd rust/
 cargo build --release
 
-# Run interactive REPL
+# interactive REPL
 ./target/release/claw
 
-# One-shot prompt
-./target/release/claw prompt "explain this codebase"
+# one-shot analysis
+./target/release/claw prompt "analyze this repository"
 
-# With specific model
-./target/release/claw --model sonnet prompt "fix the bug in main.rs"
+# analyze a specific path
+./target/release/claw prompt "analyze ./crates/runtime"
 ```
 
-## Configuration
+Claw automatically performs analysis by invoking local tools such as:
 
-Set your API credentials:
+- glob_search
+- grep_search
+- read_file
+- tool_search
+- todo_write
+- notebook_edit
 
-```bash
-export ANTHROPIC_API_KEY="sk-ant-..."
-# Or use a proxy
-export ANTHROPIC_BASE_URL="https://your-proxy.com"
-```
+The agent inspects source files directly and produces structured explanations of:
 
-Or authenticate via OAuth:
+- architecture
+- module relationships
+- control flow
+- data flow
+- complexity risks
+- refactoring opportunities
 
-```bash
-claw login
-```
+---
 
+# First Time Setup
 
-## Optional local retrieval database (SQLite)
+## Install SQLite (required for local retrieval index)
 
-If you use the offline/local retrieval workflow, install the `sqlite3` CLI first and make sure it is available in your system `PATH`.
+Claw uses SQLite to store indexed file metadata for retrieval-based analysis.
+
+You must install the `sqlite3` CLI and ensure it is available in PATH.
 
 ### Windows
 
-1. Download the SQLite tools bundle from the official SQLite download page.
-2. Extract `sqlite3.exe` to a stable directory such as `C:\\Tools\\sqlite`.
-3. Add that directory to your `PATH`.
+1. Download SQLite tools bundle:
+   https://www.sqlite.org/download.html
+
+2. Extract `sqlite3.exe` to:
+
+```
+C:\Tools\sqlite\
+```
+
+3. Add that directory to PATH.
+
 4. Verify installation:
 
 ```powershell
 sqlite3 --version
 ```
+
+---
 
 ### Linux
 
@@ -57,123 +81,252 @@ sqlite3 --version
 sudo apt install sqlite3
 ```
 
+---
+
 ### macOS
 
 ```bash
 brew install sqlite
 ```
 
-Without `sqlite3`, local retrieval DB initialization and indexing will fail.
+Without sqlite3, local indexing and retrieval initialization will fail.
 
-## Features
+---
+
+# Configuration
+
+Claw runs fully locally by default.
+
+Configuration sources:
+
+- `.claude.json`
+- `CLAUDE.md`
+- environment variables
+- workspace tool manifests
+
+Optional environment variables:
+
+| Variable | Purpose |
+|----------|--------|
+| CLAW_SQLITE_PATH | override sqlite database location |
+| CLAW_LOG_LEVEL | debug / info / warn / error |
+| CLAW_MAX_DEPTH | limit recursive analysis depth |
+| CLAW_MAX_FILES | cap file traversal size |
+| CLAW_CACHE_DIR | override cache directory |
+
+Example:
+
+```bash
+export CLAW_LOG_LEVEL=debug
+export CLAW_MAX_DEPTH=6
+```
+
+---
+
+# Autonomous Analysis Behavior
+
+When given a prompt referencing a path, project, or repository, Claw:
+
+1. discovers files using glob_search
+2. locates relevant symbols using grep_search
+3. reads source files using read_file
+4. constructs a structural understanding of the project
+5. produces:
+
+- architectural overview
+- module relationships
+- data flow insights
+- complexity observations
+- improvement recommendations
+
+Claw performs the analysis itself rather than instructing the user to manually run commands.
+
+---
+
+# Features
 
 | Feature | Status |
-|---------|--------|
-| Anthropic API + streaming | ✅ |
-| OAuth login/logout | ✅ |
-| Interactive REPL (rustyline) | ✅ |
-| Tool system (bash, read, write, edit, grep, glob) | ✅ |
-| Web tools (search, fetch) | ✅ |
-| Sub-agent orchestration | ✅ |
-| Todo tracking | ✅ |
-| Notebook editing | ✅ |
-| CLAUDE.md / project memory | ✅ |
-| Config file hierarchy (.claude.json) | ✅ |
-| Permission system | ✅ |
-| MCP server lifecycle | ✅ |
-| Session persistence + resume | ✅ |
-| Extended thinking (thinking blocks) | ✅ |
-| Cost tracking + usage display | ✅ |
-| Git integration | ✅ |
-| Markdown terminal rendering (ANSI) | ✅ |
-| Model aliases (opus/sonnet/haiku) | ✅ |
-| Slash commands (/status, /compact, /clear, etc.) | ✅ |
-| Hooks (PreToolUse/PostToolUse) | 🔧 Config only |
-| Plugin system | 📋 Planned |
-| Skills registry | 📋 Planned |
+|--------|--------|
+| local autonomous agent loop | ✅ |
+| native Rust tool execution | ✅ |
+| recursive project analysis | ✅ |
+| structural code understanding | ✅ |
+| symbol discovery | ✅ |
+| interactive REPL | ✅ |
+| one-shot prompt mode | ✅ |
+| session persistence | ✅ |
+| SQLite retrieval index | ✅ |
+| notebook editing | ✅ |
+| todo tracking | ✅ |
+| git-aware context | ✅ |
+| markdown terminal rendering | ✅ |
+| slash commands | ✅ |
+| tool orchestration planning | ✅ |
+| config hierarchy (.claude.json) | ✅ |
+| CLAUDE.md project memory | ✅ |
+| sub-agent task decomposition | ✅ |
+| plugin system | planned |
+| skills registry | planned |
 
-## Model Aliases
+---
 
-Short names resolve to the latest model versions:
-
-| Alias | Resolves To |
-|-------|------------|
-| `opus` | `claude-opus-4-6` |
-| `sonnet` | `claude-sonnet-4-6` |
-| `haiku` | `claude-haiku-4-5-20251213` |
-
-## CLI Flags
+# CLI Usage
 
 ```
 claw [OPTIONS] [COMMAND]
 
 Options:
-  --model MODEL                    Set the model (alias or full name)
-  --dangerously-skip-permissions   Skip all permission checks
-  --permission-mode MODE           Set read-only, workspace-write, or danger-full-access
-  --allowedTools TOOLS             Restrict enabled tools
-  --output-format FORMAT           Output format (text or json)
-  --version, -V                    Print version info
+  --model MODEL                reserved for future local models
+  --permission-mode MODE       read-only | workspace-write | danger-full-access
+  --allowedTools TOOLS         restrict tool usage
+  --output-format FORMAT       text | json
+  --version, -V                show version
 
 Commands:
-  prompt <text>      One-shot prompt (non-interactive)
-  login              Authenticate via OAuth
-  logout             Clear stored credentials
-  init               Initialize project config
-  doctor             Check environment health
-  self-update        Update to latest version
+  prompt <text>      run single analysis prompt
+  init               initialize workspace config
+  doctor             check environment health
+  self-update        update binary
 ```
 
-## Slash Commands (REPL)
+---
+
+# Slash Commands (REPL)
 
 | Command | Description |
-|---------|-------------|
-| `/help` | Show help |
-| `/status` | Show session status (model, tokens, cost) |
-| `/cost` | Show cost breakdown |
-| `/compact` | Compact conversation history |
-| `/clear` | Clear conversation |
-| `/model [name]` | Show or switch model |
-| `/permissions` | Show or switch permission mode |
-| `/config [section]` | Show config (env, hooks, model) |
-| `/memory` | Show CLAUDE.md contents |
-| `/diff` | Show git diff |
-| `/export [path]` | Export conversation |
-| `/session [id]` | Resume a previous session |
-| `/version` | Show version |
+|--------|-------------|
+| /help | show help |
+| /status | show session state |
+| /clear | clear conversation |
+| /memory | show CLAUDE.md |
+| /config | show configuration |
+| /diff | show git diff |
+| /export | export conversation |
+| /session | resume previous session |
+| /version | show version |
 
-## Workspace Layout
+---
+
+# Workspace Layout
 
 ```
 rust/
-├── Cargo.toml              # Workspace root
+├── Cargo.toml
 ├── Cargo.lock
 └── crates/
-    ├── api/                # Anthropic API client + SSE streaming
-    ├── commands/           # Shared slash-command registry
-    ├── compat-harness/     # TS manifest extraction harness
-    ├── runtime/            # Session, config, permissions, MCP, prompts
-    ├── rusty-claude-cli/   # Main CLI binary (`claw`)
-    └── tools/              # Built-in tool implementations
+    ├── api/                local model adapter interface
+    ├── commands/           slash command registry
+    ├── compat-harness/     manifest extraction harness
+    ├── runtime/            agent loop and planning engine
+    ├── rusty-claude-cli/   CLI interface
+    └── tools/              tool implementations
 ```
 
-### Crate Responsibilities
+---
 
-- **api** — HTTP client, SSE stream parser, request/response types, auth (API key + OAuth bearer)
-- **commands** — Slash command definitions and help text generation
-- **compat-harness** — Extracts tool/prompt manifests from upstream TS source
-- **runtime** — `ConversationRuntime` agentic loop, `ConfigLoader` hierarchy, `Session` persistence, permission policy, MCP client, system prompt assembly, usage tracking
-- **rusty-claude-cli** — REPL, one-shot prompt, streaming display, tool call rendering, CLI argument parsing
-- **tools** — Tool specs + execution: Bash, ReadFile, WriteFile, EditFile, GlobSearch, GrepSearch, WebSearch, WebFetch, Agent, TodoWrite, NotebookEdit, Skill, ToolSearch, REPL runtimes
+# Crate Responsibilities
 
-## Stats
+## runtime
 
-- **~20K lines** of Rust
-- **6 crates** in workspace
-- **Binary name:** `claw`
-- **Default model:** `claude-opus-4-6`
-- **Default permissions:** `danger-full-access`
+Core agent loop:
 
-## License
+- conversation state
+- planning logic
+- tool orchestration
+- context assembly
+- session persistence
+
+## tools
+
+Tool implementations:
+
+| Tool | Purpose |
+|------|--------|
+| glob_search | enumerate files |
+| grep_search | search symbols |
+| read_file | inspect source |
+| write_file | modify files |
+| edit_file | patch content |
+| tool_search | discover tools |
+| todo_write | track tasks |
+| notebook_edit | structured notes |
+| bash | shell execution |
+
+## rusty-claude-cli
+
+CLI interface:
+
+- interactive REPL
+- streaming output
+- slash commands
+- argument parsing
+
+## commands
+
+Slash command definitions.
+
+## compat-harness
+
+Extracts manifest definitions from tool specifications.
+
+## api
+
+Interface layer for future local model backends.
+
+---
+
+# Example Prompts
+
+Analyze entire workspace:
+
+```
+analyze this repository
+```
+
+Analyze a specific crate:
+
+```
+analyze ./crates/runtime
+```
+
+Find architectural issues:
+
+```
+identify architectural risks in this project
+```
+
+Map module relationships:
+
+```
+map module relationships and data flow
+```
+
+Locate complex code:
+
+```
+find high complexity modules
+```
+
+Security review:
+
+```
+identify unsafe patterns
+```
+
+---
+
+# Stats
+
+| Metric | Value |
+|--------|------|
+| language | Rust |
+| workspace crates | 6 |
+| binary name | claw |
+| execution model | local |
+| analysis depth | recursive |
+
+---
+
+# License
 
 See repository root.
