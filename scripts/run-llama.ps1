@@ -1,5 +1,5 @@
 param(
-    [string]$ModelPath = ".\data\models\qwen2.5-coder-1.5b-instruct-q4_k_m.gguf",
+    [string]$ModelPath = ".\data\models\model.gguf",
     [string]$ServerPath = ".\runners\llama\llama-server.exe",
     [string]$Host = "127.0.0.1",
     [int]$Port = 8081,
