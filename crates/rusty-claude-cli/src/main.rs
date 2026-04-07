@@ -6,8 +6,7 @@ use std::collections::BTreeSet;
 use std::env;
 use std::fmt::Write as _;
 use std::fs;
-use std::io::{self, Read, Write};
-use std::net::TcpListener;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
@@ -16,9 +15,9 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use api::{
-    resolve_startup_auth_source, AnthropicClient, AuthSource, ContentBlockDelta, InputContentBlock,
-    InputMessage, MessageRequest, MessageResponse, OutputContentBlock,
-    StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
+    ContentBlockDelta, InputContentBlock, InputMessage, LocalModelClient, MessageRequest,
+    MessageResponse, OutputContentBlock, StreamEvent as ApiStreamEvent, ToolChoice,
+    ToolDefinition, ToolResultContentBlock,
 };
 
 use commands::{
@@ -30,17 +29,15 @@ use init::initialize_repo;
 use plugins::{PluginManager, PluginManagerConfig, PluginRegistry};
 use render::{MarkdownStreamState, Spinner, TerminalRenderer};
 use runtime::{
-    clear_oauth_credentials, generate_pkce_pair, generate_state, load_system_prompt,
-    parse_oauth_callback_request_target, save_oauth_credentials, ApiClient, ApiRequest,
-    AssistantEvent, CompactionConfig, ConfigLoader, ConfigSource, ContentBlock,
-    ConversationMessage, ConversationRuntime, MessageRole, OAuthAuthorizationRequest, OAuthConfig,
-    OAuthTokenExchangeRequest, PermissionMode, PermissionPolicy, ProjectContext, RuntimeError,
-    Session, TokenUsage, ToolError, ToolExecutor, UsageTracker,
+    ApiClient, ApiRequest, AssistantEvent, CompactionConfig, ConfigLoader, ConfigSource,
+    ContentBlock, ConversationMessage, ConversationRuntime, MessageRole, PermissionMode,
+    PermissionPolicy, ProjectContext, RuntimeError, Session, TokenUsage, ToolError, ToolExecutor,
+    UsageTracker, load_system_prompt,
 };
 use serde_json::json;
 use tools::GlobalToolRegistry;
 
-const DEFAULT_MODEL: &str = "claude-opus-4-6";
+const DEFAULT_MODEL: &str = "qwen2.5-coder:7b";
 fn max_tokens_for_model(model: &str) -> u32 {
     if model.contains("opus") {
         32_000
@@ -49,7 +46,6 @@ fn max_tokens_for_model(model: &str) -> u32 {
     }
 }
 const DEFAULT_DATE: &str = "2026-03-31";
-const DEFAULT_OAUTH_CALLBACK_PORT: u16 = 4545;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const BUILD_TARGET: Option<&str> = option_env!("TARGET");
 const GIT_SHA: Option<&str> = option_env!("GIT_SHA");
@@ -87,8 +83,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             permission_mode,
         } => LiveCli::new(model, true, allowed_tools, permission_mode)?
             .run_turn_with_output(&prompt, output_format)?,
-        CliAction::Login => run_login()?,
-        CliAction::Logout => run_logout()?,
         CliAction::Init => run_init()?,
         CliAction::Repl {
             model,
@@ -120,8 +114,6 @@ enum CliAction {
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
     },
-    Login,
-    Logout,
     Init,
     Repl {
         model: String,
@@ -268,8 +260,6 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         "dump-manifests" => Ok(CliAction::DumpManifests),
         "bootstrap-plan" => Ok(CliAction::BootstrapPlan),
         "system-prompt" => parse_system_prompt_args(&rest[1..]),
-        "login" => Ok(CliAction::Login),
-        "logout" => Ok(CliAction::Logout),
         "init" => Ok(CliAction::Init),
         "prompt" => {
             let prompt = rest[1..].join(" ");
@@ -297,9 +287,9 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
 
 fn resolve_model_alias(model: &str) -> &str {
     match model {
-        "opus" => "claude-opus-4-6",
-        "sonnet" => "claude-sonnet-4-6",
-        "haiku" => "claude-haiku-4-5-20251213",
+        "opus" => "qwen2.5-coder:32b",
+        "sonnet" => "qwen2.5-coder:14b",
+        "haiku" => "qwen2.5-coder:7b",
         _ => model,
     }
 }
@@ -421,131 +411,12 @@ fn print_bootstrap_plan() {
     }
 }
 
-fn default_oauth_config() -> OAuthConfig {
-    OAuthConfig {
-        client_id: String::from("9d1c250a-e61b-44d9-88ed-5944d1962f5e"),
-        authorize_url: String::from("https://platform.claude.com/oauth/authorize"),
-        token_url: String::from("https://platform.claude.com/v1/oauth/token"),
-        callback_port: None,
-        manual_redirect_url: None,
-        scopes: vec![
-            String::from("user:profile"),
-            String::from("user:inference"),
-            String::from("user:sessions:claude_code"),
-        ],
-    }
-}
-
 fn run_login() -> Result<(), Box<dyn std::error::Error>> {
-    let cwd = env::current_dir()?;
-    let config = ConfigLoader::default_for(&cwd).load()?;
-    let default_oauth = default_oauth_config();
-    let oauth = config.oauth().unwrap_or(&default_oauth);
-    let callback_port = oauth.callback_port.unwrap_or(DEFAULT_OAUTH_CALLBACK_PORT);
-    let redirect_uri = runtime::loopback_redirect_uri(callback_port);
-    let pkce = generate_pkce_pair()?;
-    let state = generate_state()?;
-    let authorize_url =
-        OAuthAuthorizationRequest::from_config(oauth, redirect_uri.clone(), state.clone(), &pkce)
-            .build_url();
-
-    println!("Starting Claude OAuth login...");
-    println!("Listening for callback on {redirect_uri}");
-    if let Err(error) = open_browser(&authorize_url) {
-        eprintln!("warning: failed to open browser automatically: {error}");
-        println!("Open this URL manually:\n{authorize_url}");
-    }
-
-    let callback = wait_for_oauth_callback(callback_port)?;
-    if let Some(error) = callback.error {
-        let description = callback
-            .error_description
-            .unwrap_or_else(|| "authorization failed".to_string());
-        return Err(io::Error::other(format!("{error}: {description}")).into());
-    }
-    let code = callback.code.ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidData, "callback did not include code")
-    })?;
-    let returned_state = callback.state.ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidData, "callback did not include state")
-    })?;
-    if returned_state != state {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "oauth state mismatch").into());
-    }
-
-    let client = AnthropicClient::from_auth(AuthSource::None).with_base_url(api::read_base_url());
-    let exchange_request =
-        OAuthTokenExchangeRequest::from_config(oauth, code, state, pkce.verifier, redirect_uri);
-    let runtime = tokio::runtime::Runtime::new()?;
-    let token_set = runtime.block_on(client.exchange_oauth_code(oauth, &exchange_request))?;
-    save_oauth_credentials(&runtime::OAuthTokenSet {
-        access_token: token_set.access_token,
-        refresh_token: token_set.refresh_token,
-        expires_at: token_set.expires_at,
-        scopes: token_set.scopes,
-    })?;
-    println!("Claude OAuth login complete.");
-    Ok(())
+    Err(io::Error::other("offline builds do not support provider login; set CLAW_LOCAL_BASE_URL to a local model endpoint").into())
 }
 
 fn run_logout() -> Result<(), Box<dyn std::error::Error>> {
-    clear_oauth_credentials()?;
-    println!("Claude OAuth credentials cleared.");
-    Ok(())
-}
-
-fn open_browser(url: &str) -> io::Result<()> {
-    let commands = if cfg!(target_os = "macos") {
-        vec![("open", vec![url])]
-    } else if cfg!(target_os = "windows") {
-        vec![("cmd", vec!["/C", "start", "", url])]
-    } else {
-        vec![("xdg-open", vec![url])]
-    };
-    for (program, args) in commands {
-        match Command::new(program).args(args).spawn() {
-            Ok(_) => return Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
-    }
-    Err(io::Error::new(
-        io::ErrorKind::NotFound,
-        "no supported browser opener command found",
-    ))
-}
-
-fn wait_for_oauth_callback(
-    port: u16,
-) -> Result<runtime::OAuthCallbackParams, Box<dyn std::error::Error>> {
-    let listener = TcpListener::bind(("127.0.0.1", port))?;
-    let (mut stream, _) = listener.accept()?;
-    let mut buffer = [0_u8; 4096];
-    let bytes_read = stream.read(&mut buffer)?;
-    let request = String::from_utf8_lossy(&buffer[..bytes_read]);
-    let request_line = request.lines().next().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidData, "missing callback request line")
-    })?;
-    let target = request_line.split_whitespace().nth(1).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "missing callback request target",
-        )
-    })?;
-    let callback = parse_oauth_callback_request_target(target)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    let body = if callback.error.is_some() {
-        "Claude OAuth login failed. You can close this window."
-    } else {
-        "Claude OAuth login succeeded. You can close this window."
-    };
-    let response = format!(
-        "HTTP/1.1 200 OK\r\ncontent-type: text/plain; charset=utf-8\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-        body.len(),
-        body
-    );
-    stream.write_all(response.as_bytes())?;
-    Ok(callback)
+    Err(io::Error::other("offline builds do not maintain provider credentials").into())
 }
 
 fn print_system_prompt(cwd: PathBuf, date: String) {
@@ -968,7 +839,7 @@ struct LiveCli {
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
     system_prompt: Vec<String>,
-    runtime: ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>,
+    runtime: ConversationRuntime<LocalRuntimeClient, CliToolExecutor>,
     session: SessionHandle,
 }
 
@@ -1088,7 +959,7 @@ impl LiveCli {
         emit_output: bool,
     ) -> Result<
         (
-            ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>,
+            ConversationRuntime<LocalRuntimeClient, CliToolExecutor>,
             HookAbortMonitor,
         ),
         Box<dyn std::error::Error>,
@@ -2830,12 +2701,12 @@ fn build_runtime(
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
     progress_reporter: Option<InternalPromptProgressReporter>,
-) -> Result<ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>, Box<dyn std::error::Error>>
+) -> Result<ConversationRuntime<LocalRuntimeClient, CliToolExecutor>, Box<dyn std::error::Error>>
 {
     let (feature_config, plugin_registry, tool_registry) = build_runtime_plugin_state()?;
     let mut runtime = ConversationRuntime::new_with_plugins(
         session,
-        AnthropicRuntimeClient::new(
+        LocalRuntimeClient::new(
             model,
             enable_tools,
             emit_output,
@@ -2934,48 +2805,16 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
     }
 }
 
-struct AnthropicRuntimeClient {
-    runtime: tokio::runtime::Runtime,
-    client: AnthropicClient,
-    model: String,
-    enable_tools: bool,
-    emit_output: bool,
-    allowed_tools: Option<AllowedToolSet>,
-    tool_registry: GlobalToolRegistry,
-    progress_reporter: Option<InternalPromptProgressReporter>,
-}
 
-impl AnthropicRuntimeClient {
-    fn new(
-        model: String,
-        enable_tools: bool,
-        emit_output: bool,
-        allowed_tools: Option<AllowedToolSet>,
-        tool_registry: GlobalToolRegistry,
-        progress_reporter: Option<InternalPromptProgressReporter>,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
-        Ok(Self {
-            runtime: tokio::runtime::Runtime::new()?,
-            client: AnthropicClient::from_auth(resolve_cli_auth_source()?)
-                .with_base_url(api::read_base_url()),
-            model,
-            enable_tools,
-            emit_output,
-            allowed_tools,
-            tool_registry,
-            progress_reporter,
-        })
-    }
-}
+const MAX_PROJECT_CONTEXT_CHARS: usize = 18_000;
+const MAX_FILE_EXCERPT_CHARS: usize = 4_000;
+const MAX_ANALYZED_FILES: usize = 8;
+const MAX_TREE_ENTRIES: usize = 160;
 
-fn resolve_cli_auth_source() -> Result<AuthSource, Box<dyn std::error::Error>> {
-    Ok(resolve_startup_auth_source(|| {
-        let cwd = env::current_dir().map_err(api::ApiError::from)?;
-        let config = ConfigLoader::default_for(&cwd).load().map_err(|error| {
-            api::ApiError::Auth(format!("failed to load runtime OAuth config: {error}"))
-        })?;
-        Ok(config.oauth().cloned())
-    })?)
+fn maybe_build_project_analysis_context(messages: &[ConversationMessage]) -> Option<String> {
+    let latest_user_text = latest_user_text(messages)?;
+    let detected_path = detect_existing_path(&latest_user_text)?;
+    build_project_analysis_context(&detected_path, &latest_user_text).ok()
 }
 
 fn latest_user_text(messages: &[ConversationMessage]) -> Option<String> {
@@ -2997,78 +2836,313 @@ fn latest_user_text(messages: &[ConversationMessage]) -> Option<String> {
         .filter(|text| !text.trim().is_empty())
 }
 
-fn detect_existing_paths(text: &str) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    let mut seen = std::collections::BTreeSet::new();
-    for raw in text.split_whitespace() {
-        let trimmed = raw.trim_matches(|ch: char| matches!(ch, '"' | ''' | '`' | ',' | ';' | ':' | '(' | ')' | '[' | ']' | '{' | '}' ));
-        if trimmed.is_empty() {
+fn detect_existing_path(input: &str) -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+
+    for quoted in input.split('"').skip(1).step_by(2) {
+        let trimmed = quoted.trim();
+        if !trimmed.is_empty() {
+            candidates.push(trimmed.to_string());
+        }
+    }
+
+    let separators: &[char] = &['\n', '\r', '\t', ',', ';', '(', ')'];
+    for token in input.split(separators) {
+        let trimmed = token.trim().trim_matches('"').trim_matches('\'');
+        if trimmed.contains(':') || trimmed.contains('\\') || trimmed.contains('/') || trimmed.starts_with('.') {
+            if !trimmed.is_empty() {
+                candidates.push(trimmed.to_string());
+            }
+        }
+    }
+
+    candidates.sort();
+    candidates.dedup();
+
+    candidates
+        .into_iter()
+        .map(PathBuf::from)
+        .find(|path| path.exists())
+}
+
+fn build_project_analysis_context(path: &Path, query: &str) -> io::Result<String> {
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let mut context = String::new();
+    context.push_str("PROJECT ANALYSIS MODE\n");
+    context.push_str("The user provided a real local path and actual project context from disk is included below. ");
+    context.push_str("Do not claim that the source code was not provided. Base the answer only on the provided project tree and source excerpts. ");
+    context.push_str("Explicitly name the files that were actually analyzed. If the coverage is partial, say which files should be read next for deeper analysis.\n\n");
+    context.push_str(&format!("Target path: {}\n\n", canonical.display()));
+
+    if canonical.is_file() {
+        let excerpt = excerpt_file(&canonical, query, MAX_FILE_EXCERPT_CHARS)?;
+        context.push_str("[ANALYZED SOURCE EXCERPTS]\n");
+        context.push_str(&format!("FILE: {}\n{}\n", canonical.display(), excerpt));
+        return Ok(context);
+    }
+
+    let tree_entries = collect_tree_entries(&canonical)?;
+    context.push_str("[PROJECT TREE]\n");
+    if tree_entries.is_empty() {
+        context.push_str("(empty directory)\n\n");
+    } else {
+        for entry in tree_entries.iter().take(MAX_TREE_ENTRIES) {
+            context.push_str("- ");
+            context.push_str(entry);
+            context.push('\n');
+        }
+        if tree_entries.len() > MAX_TREE_ENTRIES {
+            context.push_str(&format!("- ... ({} additional entries omitted)\n", tree_entries.len() - MAX_TREE_ENTRIES));
+        }
+        context.push('\n');
+    }
+
+    let selected_files = select_relevant_files(&canonical, query)?;
+    if selected_files.is_empty() {
+        context.push_str("[ANALYZED SOURCE EXCERPTS]\nNo supported source files were selected from this directory. Provide a structural overview based on the tree only.\n");
+        return Ok(context);
+    }
+
+    context.push_str("[ANALYZED SOURCE EXCERPTS]\n");
+    let mut analyzed_files = Vec::new();
+    let mut used_chars = context.len();
+    for file in selected_files {
+        if analyzed_files.len() >= MAX_ANALYZED_FILES || used_chars >= MAX_PROJECT_CONTEXT_CHARS {
+            break;
+        }
+        let excerpt = excerpt_file(&file, query, MAX_FILE_EXCERPT_CHARS)?;
+        if excerpt.trim().is_empty() {
             continue;
         }
-        let candidates = [trimmed, trimmed.strip_suffix('.').unwrap_or(trimmed)];
-        for cand in candidates {
-            if cand.is_empty() { continue; }
-            let path = PathBuf::from(cand);
-            let resolved = if path.is_absolute() { path } else { std::env::current_dir().ok().map(|cwd| cwd.join(cand)).unwrap_or_else(|| PathBuf::from(cand)) };
-            if resolved.exists() {
-                let key = resolved.to_string_lossy().to_string();
-                if seen.insert(key) {
-                    out.push(resolved);
-                }
+        let block = format!("FILE: {}\n{}\n\n", file.display(), excerpt);
+        if used_chars + block.len() > MAX_PROJECT_CONTEXT_CHARS && !analyzed_files.is_empty() {
+            break;
+        }
+        used_chars += block.len();
+        analyzed_files.push(file);
+        context.push_str(&block);
+    }
+
+    if !analyzed_files.is_empty() {
+        let names = analyzed_files
+            .iter()
+            .map(|path| path.strip_prefix(&canonical).unwrap_or(path).display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        context.push_str(&format!("Analyzed files: {}\n", names));
+        context.push_str("Only these files were analyzed from source. If deeper analysis is needed, continue with a narrower follow-up focused on the next most relevant files.\n");
+    }
+
+    Ok(context)
+}
+
+fn collect_tree_entries(root: &Path) -> io::Result<Vec<String>> {
+    let mut entries = Vec::new();
+    let mut queue = std::collections::VecDeque::from([root.to_path_buf()]);
+    while let Some(dir) = queue.pop_front() {
+        let mut children = fs::read_dir(&dir)?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| !should_skip_path(path))
+            .collect::<Vec<_>>();
+        children.sort();
+        for child in children {
+            let rel = child.strip_prefix(root).unwrap_or(&child).display().to_string();
+            entries.push(rel);
+            if child.is_dir() && entries.len() < MAX_TREE_ENTRIES * 4 {
+                queue.push_back(child);
+            }
+        }
+        if entries.len() >= MAX_TREE_ENTRIES * 4 {
+            break;
+        }
+    }
+    Ok(entries)
+}
+
+fn select_relevant_files(root: &Path, query: &str) -> io::Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    let mut queue = std::collections::VecDeque::from([root.to_path_buf()]);
+    while let Some(dir) = queue.pop_front() {
+        let mut children = fs::read_dir(&dir)?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| !should_skip_path(path))
+            .collect::<Vec<_>>();
+        children.sort();
+        for child in children {
+            if child.is_dir() {
+                queue.push_back(child);
+            } else if is_supported_analysis_file(&child) {
+                files.push(child);
+            }
+        }
+    }
+
+    let query_terms = query_terms(query);
+    files.sort_by_key(|path| file_priority_score(path, &query_terms));
+    Ok(files)
+}
+
+fn file_priority_score(path: &Path, query_terms: &[String]) -> (i32, Reverse<usize>, usize, String) {
+    let path_text = path.to_string_lossy().to_ascii_lowercase();
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    let mut priority = 100;
+    if file_name == "cargo.toml" {
+        priority = 0;
+    } else if file_name == "main.rs" {
+        priority = 1;
+    } else if file_name == "lib.rs" {
+        priority = 2;
+    } else if file_name == "mod.rs" {
+        priority = 3;
+    }
+
+    let mut matches = 0usize;
+    for term in query_terms {
+        if path_text.contains(term) {
+            matches += 1;
+        }
+    }
+
+    let size_bias = fs::metadata(path).map(|meta| meta.len() as usize).unwrap_or(0);
+    (priority, Reverse(matches), size_bias, path_text)
+}
+
+fn query_terms(query: &str) -> Vec<String> {
+    query
+        .split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-')
+        .map(|term| term.trim().to_ascii_lowercase())
+        .filter(|term| term.len() >= 3)
+        .collect()
+}
+
+fn should_skip_path(path: &Path) -> bool {
+    path.components().any(|component| {
+        let name = component.as_os_str().to_string_lossy();
+        matches!(
+            name.as_ref(),
+            ".git" | "target" | "node_modules" | "dist" | "build" | "vendor" | ".idea" | ".vscode" | "__pycache__"
+        )
+    })
+}
+
+fn is_supported_analysis_file(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|ext| ext.to_str()).map(|ext| ext.to_ascii_lowercase()),
+        Some(ext) if matches!(ext.as_str(), "rs" | "toml" | "md" | "txt" | "asm" | "s" | "c" | "h" | "cpp" | "hpp" | "cc" | "cxx" | "json" | "yml" | "yaml")
+    )
+}
+
+fn excerpt_file(path: &Path, query: &str, max_chars: usize) -> io::Result<String> {
+    let content = fs::read_to_string(path)?;
+    if content.len() <= max_chars {
+        return Ok(content);
+    }
+
+    let lines = content.lines().collect::<Vec<_>>();
+    if lines.is_empty() {
+        return Ok(String::new());
+    }
+
+    let query_terms = query_terms(query);
+    let mut selected = Vec::new();
+    let mut push_window = |start: usize, end: usize| {
+        let mut block = String::new();
+        for (idx, line) in lines[start.min(lines.len())..end.min(lines.len())].iter().enumerate() {
+            block.push_str(&format!("{:>4}: {}\n", start + idx + 1, line));
+        }
+        if !block.trim().is_empty() && !selected.contains(&block) {
+            selected.push(block);
+        }
+    };
+
+    push_window(0, 80);
+
+    let structural_needles = ["pub fn ", "fn ", "impl ", "struct ", "enum ", "trait ", "mod ", "unsafe", "match "];
+    for (idx, line) in lines.iter().enumerate() {
+        let lowercase = line.to_ascii_lowercase();
+        let structural_hit = structural_needles.iter().any(|needle| lowercase.contains(needle));
+        let query_hit = query_terms.iter().any(|term| lowercase.contains(term));
+        if structural_hit || query_hit {
+            let start = idx.saturating_sub(4);
+            let end = (idx + 12).min(lines.len());
+            push_window(start, end);
+            if selected.len() >= 8 {
                 break;
             }
         }
     }
-    out
+
+    let mut excerpt = selected.join("\n");
+    if excerpt.len() > max_chars {
+        excerpt.truncate(max_chars);
+        excerpt.push_str("\n... [truncated]\n");
+    }
+    Ok(excerpt)
 }
 
-fn local_analysis_system_hint(messages: &[ConversationMessage]) -> Option<String> {
-    let user_text = latest_user_text(messages)?;
-    let paths = detect_existing_paths(&user_text);
-    if paths.is_empty() {
-        return None;
-    }
-
-    let mut lines = vec![
-        "# Local path analysis mode".to_string(),
-        "The latest user message references one or more REAL local filesystem paths that exist in the current workspace or on disk.".to_string(),
-        "Do NOT give the user generic steps or shell commands for how they could inspect the code themselves unless they explicitly ask for commands.".to_string(),
-        "Instead, use the available tools to inspect the path yourself and then provide the analysis.".to_string(),
-        "For directories: use glob_search to discover relevant files, then read_file and grep_search to inspect the real source.".to_string(),
-        "For files: use read_file directly, and use grep_search only if more context is needed.".to_string(),
-        "Base your answer only on files you actually inspected. Explicitly name the files you read. If coverage is partial, say what you inspected and what should be read next.".to_string(),
-        "Prioritize Cargo.toml, src/main.rs, src/lib.rs, mod.rs, query-relevant files, and files containing unsafe, impl, pub fn, trait, struct, or enum definitions.".to_string(),
-        "Do not claim that the source code was not provided when you have access to it through tools.".to_string(),
-        "Referenced existing paths:".to_string(),
-    ];
-    for path in paths {
-        lines.push(format!("- {}", path.display()));
-    }
-    Some(lines.join("\n"))
+struct LocalRuntimeClient {
+    runtime: tokio::runtime::Runtime,
+    client: LocalModelClient,
+    model: String,
+    enable_tools: bool,
+    emit_output: bool,
+    allowed_tools: Option<AllowedToolSet>,
+    tool_registry: GlobalToolRegistry,
+    progress_reporter: Option<InternalPromptProgressReporter>,
 }
 
-fn augment_system_prompt_for_local_analysis(request: &ApiRequest) -> Vec<String> {
-    let mut prompt = request.system_prompt.clone();
-    if let Some(extra) = local_analysis_system_hint(&request.messages) {
-        prompt.push(extra);
+impl LocalRuntimeClient {
+    fn new(
+        model: String,
+        enable_tools: bool,
+        emit_output: bool,
+        allowed_tools: Option<AllowedToolSet>,
+        tool_registry: GlobalToolRegistry,
+        progress_reporter: Option<InternalPromptProgressReporter>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Ok(Self {
+            runtime: tokio::runtime::Runtime::new()?,
+            client: LocalModelClient::new().with_base_url(api::read_base_url()),
+            model,
+            enable_tools,
+            emit_output,
+            allowed_tools,
+            tool_registry,
+            progress_reporter,
+        })
     }
-    prompt
 }
 
-impl ApiClient for AnthropicRuntimeClient {
+impl ApiClient for LocalRuntimeClient {
     #[allow(clippy::too_many_lines)]
     fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
         if let Some(progress_reporter) = &self.progress_reporter {
             progress_reporter.mark_model_phase();
         }
+        let mut system_prompt = (!request.system_prompt.is_empty())
+            .then(|| request.system_prompt.join("\n\n"));
+        if let Some(project_context) = maybe_build_project_analysis_context(&request.messages) {
+            match &mut system_prompt {
+                Some(system) => {
+                    system.push_str("\n\n");
+                    system.push_str(&project_context);
+                }
+                None => system_prompt = Some(project_context),
+            }
+        }
+
         let message_request = MessageRequest {
             model: self.model.clone(),
             max_tokens: max_tokens_for_model(&self.model),
             messages: convert_messages(&request.messages),
-            system: {
-                let prompt = augment_system_prompt_for_local_analysis(&request);
-                (!prompt.is_empty()).then(|| prompt.join("\n\n"))
-            },
+            system: system_prompt,
             tools: self
                 .enable_tools
                 .then(|| filter_tool_specs(&self.tool_registry, self.allowed_tools.as_ref())),
@@ -3899,8 +3973,6 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "  claw dump-manifests")?;
     writeln!(out, "  claw bootstrap-plan")?;
     writeln!(out, "  claw system-prompt [--cwd PATH] [--date YYYY-MM-DD]")?;
-    writeln!(out, "  claw login")?;
-    writeln!(out, "  claw logout")?;
     writeln!(out, "  claw init")?;
     writeln!(out)?;
     writeln!(out, "Flags:")?;
@@ -3952,7 +4024,6 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         out,
         "  claw --resume session.json /status /diff /export notes.txt"
     )?;
-    writeln!(out, "  claw login")?;
     writeln!(out, "  claw init")?;
     Ok(())
 }
@@ -4046,7 +4117,7 @@ mod tests {
         let args = vec![
             "--output-format=json".to_string(),
             "--model".to_string(),
-            "claude-opus".to_string(),
+            "qwen2.5-coder:32b".to_string(),
             "explain".to_string(),
             "this".to_string(),
         ];
@@ -4054,7 +4125,7 @@ mod tests {
             parse_args(&args).expect("args should parse"),
             CliAction::Prompt {
                 prompt: "explain this".to_string(),
-                model: "claude-opus".to_string(),
+                model: "qwen2.5-coder:32b".to_string(),
                 output_format: CliOutputFormat::Json,
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
@@ -4074,7 +4145,7 @@ mod tests {
             parse_args(&args).expect("args should parse"),
             CliAction::Prompt {
                 prompt: "explain this".to_string(),
-                model: "claude-opus-4-6".to_string(),
+                model: "qwen2.5-coder:7b".to_string(),
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
@@ -4084,10 +4155,10 @@ mod tests {
 
     #[test]
     fn resolves_known_model_aliases() {
-        assert_eq!(resolve_model_alias("opus"), "claude-opus-4-6");
-        assert_eq!(resolve_model_alias("sonnet"), "claude-sonnet-4-6");
-        assert_eq!(resolve_model_alias("haiku"), "claude-haiku-4-5-20251213");
-        assert_eq!(resolve_model_alias("claude-opus"), "claude-opus");
+        assert_eq!(resolve_model_alias("opus"), "qwen2.5-coder:32b");
+        assert_eq!(resolve_model_alias("sonnet"), "qwen2.5-coder:14b");
+        assert_eq!(resolve_model_alias("haiku"), "qwen2.5-coder:7b");
+        assert_eq!(resolve_model_alias("custom-model"), "custom-model");
     }
 
     #[test]
@@ -4159,22 +4230,6 @@ mod tests {
                 cwd: PathBuf::from("/tmp/project"),
                 date: "2026-04-01".to_string(),
             }
-        );
-    }
-
-    #[test]
-    fn parses_login_and_logout_subcommands() {
-        assert_eq!(
-            parse_args(&["login".to_string()]).expect("login should parse"),
-            CliAction::Login
-        );
-        assert_eq!(
-            parse_args(&["logout".to_string()]).expect("logout should parse"),
-            CliAction::Logout
-        );
-        assert_eq!(
-            parse_args(&["init".to_string()]).expect("init should parse"),
-            CliAction::Init
         );
     }
 
@@ -4783,7 +4838,7 @@ mod tests {
             MessageResponse {
                 id: "msg-1".to_string(),
                 kind: "message".to_string(),
-                model: "claude-opus-4-6".to_string(),
+                model: "qwen2.5-coder:7b".to_string(),
                 role: "assistant".to_string(),
                 content: vec![OutputContentBlock::ToolUse {
                     id: "tool-1".to_string(),
@@ -4818,7 +4873,7 @@ mod tests {
             MessageResponse {
                 id: "msg-2".to_string(),
                 kind: "message".to_string(),
-                model: "claude-opus-4-6".to_string(),
+                model: "qwen2.5-coder:7b".to_string(),
                 role: "assistant".to_string(),
                 content: vec![OutputContentBlock::ToolUse {
                     id: "tool-2".to_string(),
@@ -4853,7 +4908,7 @@ mod tests {
             MessageResponse {
                 id: "msg-3".to_string(),
                 kind: "message".to_string(),
-                model: "claude-opus-4-6".to_string(),
+                model: "qwen2.5-coder:7b".to_string(),
                 role: "assistant".to_string(),
                 content: vec![
                     OutputContentBlock::Thinking {

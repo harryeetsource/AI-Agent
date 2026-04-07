@@ -4,7 +4,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-pub const DEFAULT_REMOTE_BASE_URL: &str = "https://api.anthropic.com";
+pub const DEFAULT_REMOTE_BASE_URL: &str = "http://127.0.0.1:11434";
 pub const DEFAULT_SESSION_TOKEN_PATH: &str = "/run/ccr/session_token";
 pub const DEFAULT_SYSTEM_CA_BUNDLE: &str = "/etc/ssl/certs/ca-certificates.crt";
 
@@ -19,7 +19,7 @@ pub const UPSTREAM_PROXY_ENV_KEYS: [&str; 8] = [
     "CURL_CA_BUNDLE",
 ];
 
-pub const NO_PROXY_HOSTS: [&str; 16] = [
+pub const NO_PROXY_HOSTS: [&str; 13] = [
     "localhost",
     "127.0.0.1",
     "::1",
@@ -27,9 +27,6 @@ pub const NO_PROXY_HOSTS: [&str; 16] = [
     "10.0.0.0/8",
     "172.16.0.0/12",
     "192.168.0.0/16",
-    "anthropic.com",
-    ".anthropic.com",
-    "*.anthropic.com",
     "github.com",
     "api.github.com",
     "*.github.com",
@@ -78,7 +75,7 @@ impl RemoteSessionContext {
                 .filter(|value| !value.is_empty())
                 .cloned(),
             base_url: env_map
-                .get("ANTHROPIC_BASE_URL")
+                .get("CLAW_LOCAL_BASE_URL")
                 .filter(|value| !value.is_empty())
                 .cloned()
                 .unwrap_or_else(|| DEFAULT_REMOTE_BASE_URL.to_string()),
@@ -278,7 +275,7 @@ mod tests {
                 "session-123".to_string(),
             ),
             (
-                "ANTHROPIC_BASE_URL".to_string(),
+                "CLAW_LOCAL_BASE_URL".to_string(),
                 "https://remote.test".to_string(),
             ),
         ]);
@@ -314,7 +311,7 @@ mod tests {
                 "session-123".to_string(),
             ),
             (
-                "ANTHROPIC_BASE_URL".to_string(),
+                "CLAW_LOCAL_BASE_URL".to_string(),
                 "https://remote.test".to_string(),
             ),
             (
@@ -395,7 +392,6 @@ mod tests {
             upstream_proxy_ws_url("http://localhost:3000/"),
             "ws://localhost:3000/v1/code/upstreamproxy/ws"
         );
-        assert!(no_proxy_list().contains("anthropic.com"));
-        assert!(no_proxy_list().contains("github.com"));
+                assert!(no_proxy_list().contains("github.com"));
     }
 }
