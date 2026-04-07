@@ -19,17 +19,17 @@ use plugins::{HookRunner, PluginManager, PluginManagerConfig};
 use reqwest::Client;
 use runtime::{ConfigLoader, RuntimeConfig};
 use serde::Serialize;
-use tracing::{error, info};
 use tools::GlobalToolRegistry;
+use tracing::{error, info};
 
 const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_PORT: u16 = 8080;
 const DEFAULT_RUNNER_BASE_URL: &str = "http://127.0.0.1:8081";
 const DEFAULT_RUNNER_MESSAGES_PATH: &str = "/v1/messages";
-const MAX_TOOL_ROUNDS: usize = 12;
 
-const MAX_ANALYSIS_FILES: usize = 24;
-const MAX_ANALYSIS_CHARS: usize = 120_000;
+const MAX_TOOL_ROUNDS: usize = 12;
+const MAX_SUMMARY_FILES: usize = 12;
+const MAX_TOOL_OUTPUT_CHARS: usize = 6000;
 
 #[derive(Clone)]
 struct AppState {
@@ -82,8 +82,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .connect_timeout(Duration::from_secs(30))
         .build()?;
 
-    let (tool_registry, hook_runner) = build_tooling_state()
-        .map_err(std::io::Error::other)?;
+    let (tool_registry, hook_runner) =
+        build_tooling_state().map_err(std::io::Error::other)?;
 
     let state = AppState {
         http,
@@ -189,6 +189,9 @@ async fn process_message_request(
     request: &MessageRequest,
 ) -> Result<MessageResponse, Box<dyn std::error::Error + Send + Sync>> {
     let mut runner_request = maybe_enrich_request_with_local_sources(request);
+    let require_tool_use = request_has_local_path(request);
+    let mut saw_real_tool_use = false;
+
     runner_request.stream = false;
 
     let tool_specs = filtered_tool_specs(&state.tool_registry);
@@ -199,14 +202,34 @@ async fn process_message_request(
         }
     }
 
-    for _ in 0..MAX_TOOL_ROUNDS {
+    for round in 0..MAX_TOOL_ROUNDS {
         let response = call_runner(state, &runner_request).await?;
-
         let tool_uses = extract_tool_uses(&response);
 
         if tool_uses.is_empty() {
+            if require_tool_use && !saw_real_tool_use {
+                if round + 1 >= MAX_TOOL_ROUNDS {
+                    return Ok(response);
+                }
+
+                runner_request.messages.push(InputMessage {
+                    role: "user".to_string(),
+                    content: vec![InputContentBlock::Text {
+                        text: String::from(
+                            "You have not used tools yet. Do not describe a plan. \
+Do not print JSON. Use actual tool calls now to inspect the referenced path, \
+then continue the analysis.",
+                        ),
+                    }],
+                });
+
+                continue;
+            }
+
             return Ok(response);
         }
+
+        saw_real_tool_use = true;
 
         if let Some(assistant_message) = output_blocks_to_input_message(&response.content) {
             runner_request.messages.push(assistant_message);
@@ -246,6 +269,8 @@ async fn process_message_request(
                 }
                 output.push_str(&post.messages().join("\n"));
             }
+
+            let output = truncate_tool_output(&output, MAX_TOOL_OUTPUT_CHARS);
 
             runner_request.messages.push(InputMessage::user_tool_result(
                 tool_use.id,
@@ -323,14 +348,16 @@ fn output_blocks_to_input_message(blocks: &[OutputContentBlock]) -> Option<Input
     let content = blocks
         .iter()
         .filter_map(|block| match block {
-            OutputContentBlock::Text { text } => Some(InputContentBlock::Text {
-                text: text.clone(),
-            }),
-            OutputContentBlock::ToolUse { id, name, input } => Some(InputContentBlock::ToolUse {
-                id: id.clone(),
-                name: name.clone(),
-                input: input.clone(),
-            }),
+            OutputContentBlock::Text { text } => {
+                Some(InputContentBlock::Text { text: text.clone() })
+            }
+            OutputContentBlock::ToolUse { id, name, input } => {
+                Some(InputContentBlock::ToolUse {
+                    id: id.clone(),
+                    name: name.clone(),
+                    input: input.clone(),
+                })
+            }
             OutputContentBlock::Thinking { .. } | OutputContentBlock::RedactedThinking { .. } => {
                 None
             }
@@ -349,9 +376,7 @@ fn output_blocks_to_input_message(blocks: &[OutputContentBlock]) -> Option<Input
 
 fn filtered_tool_specs(tool_registry: &GlobalToolRegistry) -> Vec<ToolDefinition> {
     let mut definitions = tool_registry.definitions(None);
-    definitions.retain(|tool| {
-        !matches!(tool.name.as_str(), "SendUserMessage" | "ToolSearch")
-    });
+    definitions.retain(|tool| !matches!(tool.name.as_str(), "SendUserMessage" | "ToolSearch"));
     definitions
 }
 
@@ -411,6 +436,7 @@ fn resolve_plugin_path(cwd: &Path, config_home: &Path, value: &str) -> PathBuf {
 
 fn maybe_enrich_request_with_local_sources(request: &MessageRequest) -> MessageRequest {
     let mut runner_request = request.clone();
+
     let Some(user_text) = latest_user_text(&runner_request) else {
         return runner_request;
     };
@@ -419,20 +445,44 @@ fn maybe_enrich_request_with_local_sources(request: &MessageRequest) -> MessageR
         return runner_request;
     };
 
-    let Ok(context) = build_source_context(&target_path) else {
+    let Ok(summary) = build_source_summary(&target_path) else {
         return runner_request;
     };
-    if context.trim().is_empty() {
+
+    if summary.trim().is_empty() {
         return runner_request;
     }
 
     let analysis_instructions = format!(
-        "You have been given local filesystem context captured from the user's requested path. When the user asks to analyze a directory, crate, workspace, or source file, analyze the actual provided files and directory structure instead of suggesting shell commands. Prefer concrete observations about module boundaries, architecture, APIs, bugs, safety issues, performance, and code quality.\n\nLOCAL SOURCE CONTEXT\n====================\n{context}"
+        "The user referenced a real filesystem path.\n\
+You MUST use actual tool calls before writing analysis.\n\
+Do NOT describe your plan.\n\
+Do NOT print JSON.\n\
+Do NOT list files you intend to read.\n\
+Do NOT explain what you will inspect.\n\
+Immediately emit real tool calls.\n\n\
+Required workflow:\n\
+1. Use glob_search and grep_search to identify the true entry points and important modules.\n\
+2. Use read_file on only the most relevant files first.\n\
+3. After reading initial files, continue with at least one follow-up pass to resolve cross-module control flow.\n\
+4. Only after actual inspection, produce a grounded analysis.\n\
+5. Every conclusion must be based on real inspected files.\n\n\
+When analyzing a Rust codebase, prioritize:\n\
+- Cargo.toml\n\
+- src/main.rs\n\
+- src/lib.rs\n\
+- mod.rs files\n\
+- files referenced by module declarations\n\
+- files containing fn main, pub fn, impl, trait, enum, struct, unsafe\n\n\
+Do NOT request the entire repository at once.\n\n\
+LOCAL PATH SUMMARY\n\
+==================\n\
+{summary}"
     );
 
     match &mut runner_request.system {
         Some(system) => {
-            if !system.contains("LOCAL SOURCE CONTEXT") {
+            if !system.contains("LOCAL PATH SUMMARY") {
                 system.push_str("\n\n");
                 system.push_str(&analysis_instructions);
             }
@@ -441,6 +491,12 @@ fn maybe_enrich_request_with_local_sources(request: &MessageRequest) -> MessageR
     }
 
     runner_request
+}
+
+fn request_has_local_path(request: &MessageRequest) -> bool {
+    latest_user_text(request)
+        .and_then(|text| detect_existing_path(&text))
+        .is_some()
 }
 
 fn latest_user_text(request: &MessageRequest) -> Option<String> {
@@ -501,18 +557,20 @@ fn sanitize_path_candidate(value: &str) -> String {
         .to_string()
 }
 
-fn build_source_context(path: &Path) -> Result<String, std::io::Error> {
+fn build_source_summary(path: &Path) -> Result<String, std::io::Error> {
     if path.is_file() {
-        return build_file_context(path, MAX_ANALYSIS_CHARS);
+        return Ok(format!("Requested file:\n{}", path.display()));
     }
+
     if !path.is_dir() {
         return Ok(String::new());
     }
 
     let mut files = collect_source_files(path)?;
+
     if files.is_empty() {
         return Ok(format!(
-            "Requested path exists but no supported source files were found: {}",
+            "Directory exists but no supported source files were found:\n{}",
             path.display()
         ));
     }
@@ -520,74 +578,23 @@ fn build_source_context(path: &Path) -> Result<String, std::io::Error> {
     files.sort_by_key(|file| file_priority(file, path));
 
     let mut out = String::new();
-    out.push_str(&format!("Requested directory: {}\n\n", path.display()));
-    out.push_str("Discovered source files:\n");
-    for file in files.iter().take(MAX_ANALYSIS_FILES) {
+    out.push_str(&format!("Directory:\n{}\n\n", path.display()));
+    out.push_str("Candidate files:\n");
+
+    for file in files.iter().take(MAX_SUMMARY_FILES) {
         out.push_str("- ");
         out.push_str(&display_relative(file, path));
         out.push('\n');
     }
-    if files.len() > MAX_ANALYSIS_FILES {
+
+    if files.len() > MAX_SUMMARY_FILES {
         out.push_str(&format!(
-            "- ... {} more files omitted from listing\n",
-            files.len() - MAX_ANALYSIS_FILES
+            "- ... {} more files omitted",
+            files.len() - MAX_SUMMARY_FILES
         ));
-    }
-    out.push('\n');
-
-    let mut remaining = MAX_ANALYSIS_CHARS.saturating_sub(out.len());
-    let mut included = 0usize;
-    for file in files.into_iter().take(MAX_ANALYSIS_FILES) {
-        if remaining < 800 {
-            break;
-        }
-        let section = build_file_section(&file, path, remaining)?;
-        if section.is_empty() {
-            continue;
-        }
-        remaining = remaining.saturating_sub(section.len());
-        out.push_str(&section);
-        included += 1;
-    }
-
-    if included == 0 {
-        out.push_str("No readable source file content could be captured.");
     }
 
     Ok(out)
-}
-
-fn build_file_context(path: &Path, budget: usize) -> Result<String, std::io::Error> {
-    if !is_supported_source_file(path) {
-        return Ok(format!(
-            "Requested file is not a supported source type: {}",
-            path.display()
-        ));
-    }
-    build_file_section(path, path.parent().unwrap_or_else(|| Path::new(".")), budget)
-}
-
-fn build_file_section(path: &Path, root: &Path, budget: usize) -> Result<String, std::io::Error> {
-    let content = fs::read_to_string(path)?;
-    let mut section = String::new();
-    let rel = display_relative(path, root);
-    let lang = code_fence_lang(path);
-    section.push_str(&format!("FILE: {rel}\n```{lang}\n"));
-
-    let header_len = section.len() + 5;
-    let allowance = budget.saturating_sub(header_len).max(256);
-    let mut body = content;
-    if body.len() > allowance {
-        let mut cutoff = allowance.min(body.len());
-        while !body.is_char_boundary(cutoff) && cutoff > 0 {
-            cutoff -= 1;
-        }
-        body.truncate(cutoff);
-        body.push_str("\n/* ... truncated for context budget ... */");
-    }
-    section.push_str(&body);
-    section.push_str("\n```\n\n");
-    Ok(section)
 }
 
 fn collect_source_files(root: &Path) -> Result<Vec<PathBuf>, std::io::Error> {
@@ -618,7 +625,15 @@ fn collect_source_files_inner(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), 
 fn should_skip_dir(name: &str) -> bool {
     matches!(
         name,
-        "target" | ".git" | "node_modules" | "dist" | "build" | "vendor" | ".idea" | ".vscode" | "__pycache__"
+        "target"
+            | ".git"
+            | "node_modules"
+            | "dist"
+            | "build"
+            | "vendor"
+            | ".idea"
+            | ".vscode"
+            | "__pycache__"
     )
 }
 
@@ -635,7 +650,21 @@ fn is_supported_source_file(path: &Path) -> bool {
             .unwrap_or_default()
             .to_ascii_lowercase()
             .as_str(),
-        "rs" | "toml" | "md" | "txt" | "asm" | "s" | "c" | "h" | "cpp" | "hpp" | "cc" | "cxx" | "json" | "yml" | "yaml"
+        "rs"
+            | "toml"
+            | "md"
+            | "txt"
+            | "asm"
+            | "s"
+            | "c"
+            | "h"
+            | "cpp"
+            | "hpp"
+            | "cc"
+            | "cxx"
+            | "json"
+            | "yml"
+            | "yaml"
     )
 }
 
@@ -665,24 +694,17 @@ fn display_relative(path: &Path, root: &Path) -> String {
         .replace('\\', "/")
 }
 
-fn code_fence_lang(path: &Path) -> &'static str {
-    match path
-        .extension()
-        .and_then(|value| value.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "rs" => "rust",
-        "toml" => "toml",
-        "md" => "markdown",
-        "asm" | "s" => "asm",
-        "c" | "h" => "c",
-        "cpp" | "hpp" | "cc" | "cxx" => "cpp",
-        "json" => "json",
-        "yml" | "yaml" => "yaml",
-        _ => "text",
+fn truncate_tool_output(output: &str, max_chars: usize) -> String {
+    if output.chars().count() <= max_chars {
+        return output.to_string();
     }
+
+    let mut truncated = String::new();
+    for ch in output.chars().take(max_chars) {
+        truncated.push(ch);
+    }
+    truncated.push_str("\n... [tool output truncated] ...");
+    truncated
 }
 
 fn normalize_base_url(value: String) -> String {
