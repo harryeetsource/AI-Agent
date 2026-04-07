@@ -4,7 +4,10 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use api::{InputContentBlock, MessageRequest, MessageResponse};
+use api::{
+    InputContentBlock, InputMessage, MessageRequest, MessageResponse, OutputContentBlock,
+    ToolChoice, ToolDefinition,
+};
 use axum::{
     extract::State,
     http::{header, HeaderValue, StatusCode},
@@ -12,19 +15,28 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use plugins::{HookRunner, PluginManager, PluginManagerConfig};
 use reqwest::Client;
+use runtime::{ConfigLoader, RuntimeConfig};
 use serde::Serialize;
 use tracing::{error, info};
+use tools::GlobalToolRegistry;
 
 const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_PORT: u16 = 8080;
 const DEFAULT_RUNNER_BASE_URL: &str = "http://127.0.0.1:8081";
 const DEFAULT_RUNNER_MESSAGES_PATH: &str = "/v1/messages";
+const MAX_TOOL_ROUNDS: usize = 12;
+
+const MAX_ANALYSIS_FILES: usize = 24;
+const MAX_ANALYSIS_CHARS: usize = 120_000;
 
 #[derive(Clone)]
 struct AppState {
     http: Client,
     runner_messages_url: String,
+    tool_registry: GlobalToolRegistry,
+    hook_runner: HookRunner,
 }
 
 #[derive(Debug, Serialize)]
@@ -67,12 +79,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let http = Client::builder()
-        .timeout(Duration::from_secs(300))
+        .connect_timeout(Duration::from_secs(30))
         .build()?;
+
+    let (tool_registry, hook_runner) = build_tooling_state()
+        .map_err(std::io::Error::other)?;
 
     let state = AppState {
         http,
         runner_messages_url: runner_messages_url.clone(),
+        tool_registry,
+        hook_runner,
     };
 
     let app = Router::new()
@@ -116,8 +133,6 @@ async fn shutdown_signal() {
     }
 }
 
-
-
 async fn index() -> Html<&'static str> {
     Html(include_str!("../static/index.html"))
 }
@@ -154,10 +169,10 @@ async fn messages(
     State(state): State<AppState>,
     Json(request): Json<MessageRequest>,
 ) -> impl IntoResponse {
-    match forward_message_request(&state, &request).await {
+    match process_message_request(&state, &request).await {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
         Err(error) => {
-            error!(%error, "failed to forward message request to local runner");
+            error!(%error, "failed to process message request");
             (
                 StatusCode::BAD_GATEWAY,
                 Json(ErrorResponse {
@@ -169,24 +184,97 @@ async fn messages(
     }
 }
 
-async fn forward_message_request(
+async fn process_message_request(
     state: &AppState,
     request: &MessageRequest,
 ) -> Result<MessageResponse, Box<dyn std::error::Error + Send + Sync>> {
     let mut runner_request = maybe_enrich_request_with_local_sources(request);
-    // The local API client already synthesizes streaming events from a full MessageResponse.
-    // Force non-streaming here so llama.cpp returns a single JSON object instead of SSE.
     runner_request.stream = false;
 
+    let tool_specs = filtered_tool_specs(&state.tool_registry);
+    if !tool_specs.is_empty() {
+        runner_request.tools = Some(tool_specs);
+        if runner_request.tool_choice.is_none() {
+            runner_request.tool_choice = Some(ToolChoice::Auto);
+        }
+    }
+
+    for _ in 0..MAX_TOOL_ROUNDS {
+        let response = call_runner(state, &runner_request).await?;
+
+        let tool_uses = extract_tool_uses(&response);
+
+        if tool_uses.is_empty() {
+            return Ok(response);
+        }
+
+        if let Some(assistant_message) = output_blocks_to_input_message(&response.content) {
+            runner_request.messages.push(assistant_message);
+        }
+
+        for tool_use in tool_uses {
+            let tool_input_json = serde_json::to_string(&tool_use.input)?;
+
+            let pre = state
+                .hook_runner
+                .run_pre_tool_use(&tool_use.name, &tool_input_json);
+
+            let (mut output, is_error) = if pre.is_denied() {
+                let denied_message = if pre.messages().is_empty() {
+                    format!("tool `{}` denied by PreToolUse hook", tool_use.name)
+                } else {
+                    pre.messages().join("\n")
+                };
+                (denied_message, true)
+            } else {
+                match state.tool_registry.execute(&tool_use.name, &tool_use.input) {
+                    Ok(output) => (output, false),
+                    Err(error) => (error, true),
+                }
+            };
+
+            let post = state.hook_runner.run_post_tool_use(
+                &tool_use.name,
+                &tool_input_json,
+                &output,
+                is_error,
+            );
+
+            if !post.messages().is_empty() {
+                if !output.is_empty() {
+                    output.push('\n');
+                }
+                output.push_str(&post.messages().join("\n"));
+            }
+
+            runner_request.messages.push(InputMessage::user_tool_result(
+                tool_use.id,
+                output,
+                is_error,
+            ));
+        }
+    }
+
+    Err(std::io::Error::other(format!(
+        "tool loop exceeded {MAX_TOOL_ROUNDS} rounds"
+    ))
+    .into())
+}
+
+async fn call_runner(
+    state: &AppState,
+    request: &MessageRequest,
+) -> Result<MessageResponse, Box<dyn std::error::Error + Send + Sync>> {
     let response = state
         .http
         .post(&state.runner_messages_url)
-        .json(&runner_request)
+        .json(request)
         .send()
         .await?;
 
     let status = response.status();
     let body = response.text().await?;
+
     if !status.is_success() {
         return Err(format!(
             "runner returned HTTP {} from {}: {}",
@@ -205,13 +293,121 @@ async fn forward_message_request(
             body
         )
     })?;
+
     Ok(message)
 }
 
+#[derive(Debug, Clone)]
+struct PendingToolUse {
+    id: String,
+    name: String,
+    input: serde_json::Value,
+}
 
+fn extract_tool_uses(response: &MessageResponse) -> Vec<PendingToolUse> {
+    response
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            OutputContentBlock::ToolUse { id, name, input } => Some(PendingToolUse {
+                id: id.clone(),
+                name: name.clone(),
+                input: input.clone(),
+            }),
+            _ => None,
+        })
+        .collect()
+}
 
-const MAX_ANALYSIS_FILES: usize = 24;
-const MAX_ANALYSIS_CHARS: usize = 120_000;
+fn output_blocks_to_input_message(blocks: &[OutputContentBlock]) -> Option<InputMessage> {
+    let content = blocks
+        .iter()
+        .filter_map(|block| match block {
+            OutputContentBlock::Text { text } => Some(InputContentBlock::Text {
+                text: text.clone(),
+            }),
+            OutputContentBlock::ToolUse { id, name, input } => Some(InputContentBlock::ToolUse {
+                id: id.clone(),
+                name: name.clone(),
+                input: input.clone(),
+            }),
+            OutputContentBlock::Thinking { .. } | OutputContentBlock::RedactedThinking { .. } => {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+
+    if content.is_empty() {
+        None
+    } else {
+        Some(InputMessage {
+            role: "assistant".to_string(),
+            content,
+        })
+    }
+}
+
+fn filtered_tool_specs(tool_registry: &GlobalToolRegistry) -> Vec<ToolDefinition> {
+    let mut definitions = tool_registry.definitions(None);
+    definitions.retain(|tool| {
+        !matches!(tool.name.as_str(), "SendUserMessage" | "ToolSearch")
+    });
+    definitions
+}
+
+fn build_tooling_state() -> Result<(GlobalToolRegistry, HookRunner), String> {
+    let cwd = env::current_dir().map_err(|error| error.to_string())?;
+    let loader = ConfigLoader::default_for(&cwd);
+    let runtime_config = loader.load().map_err(|error| error.to_string())?;
+    let plugin_manager = build_plugin_manager(&cwd, &loader, &runtime_config);
+    let plugin_registry = plugin_manager
+        .plugin_registry()
+        .map_err(|error| error.to_string())?;
+    let tool_registry = GlobalToolRegistry::with_plugin_tools(
+        plugin_registry
+            .aggregated_tools()
+            .map_err(|error| error.to_string())?,
+    )?;
+    let hook_runner =
+        HookRunner::from_registry(&plugin_registry).map_err(|error| error.to_string())?;
+    Ok((tool_registry, hook_runner))
+}
+
+fn build_plugin_manager(
+    cwd: &Path,
+    loader: &ConfigLoader,
+    runtime_config: &RuntimeConfig,
+) -> PluginManager {
+    let plugin_settings = runtime_config.plugins();
+    let mut plugin_config = PluginManagerConfig::new(loader.config_home().to_path_buf());
+    plugin_config.enabled_plugins = plugin_settings.enabled_plugins().clone();
+    plugin_config.external_dirs = plugin_settings
+        .external_directories()
+        .iter()
+        .map(|path| resolve_plugin_path(cwd, loader.config_home(), path))
+        .collect();
+    plugin_config.install_root = plugin_settings
+        .install_root()
+        .map(|path| resolve_plugin_path(cwd, loader.config_home(), path));
+    plugin_config.registry_path = plugin_settings
+        .registry_path()
+        .map(|path| resolve_plugin_path(cwd, loader.config_home(), path));
+    plugin_config.bundled_root = plugin_settings
+        .bundled_root()
+        .map(|path| resolve_plugin_path(cwd, loader.config_home(), path));
+    PluginManager::new(plugin_config)
+}
+
+fn resolve_plugin_path(cwd: &Path, config_home: &Path, value: &str) -> PathBuf {
+    let path = PathBuf::from(value);
+    if path.is_absolute() {
+        path
+    } else if value.starts_with('.') {
+        cwd.join(path)
+    } else {
+        config_home.join(path)
+    }
+}
 
 fn maybe_enrich_request_with_local_sources(request: &MessageRequest) -> MessageRequest {
     let mut runner_request = request.clone();
@@ -296,7 +492,12 @@ fn detect_existing_path(text: &str) -> Option<PathBuf> {
 fn sanitize_path_candidate(value: &str) -> String {
     value
         .trim()
-        .trim_matches(|ch: char| matches!(ch, '"' | '\'' | '`' | ',' | ';' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>'))
+        .trim_matches(|ch: char| {
+            matches!(
+                ch,
+                '"' | '\'' | '`' | ',' | ';' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>'
+            )
+        })
         .to_string()
 }
 
@@ -310,7 +511,10 @@ fn build_source_context(path: &Path) -> Result<String, std::io::Error> {
 
     let mut files = collect_source_files(path)?;
     if files.is_empty() {
-        return Ok(format!("Requested path exists but no supported source files were found: {}", path.display()));
+        return Ok(format!(
+            "Requested path exists but no supported source files were found: {}",
+            path.display()
+        ));
     }
 
     files.sort_by_key(|file| file_priority(file, path));
@@ -319,14 +523,17 @@ fn build_source_context(path: &Path) -> Result<String, std::io::Error> {
     out.push_str(&format!("Requested directory: {}\n\n", path.display()));
     out.push_str("Discovered source files:\n");
     for file in files.iter().take(MAX_ANALYSIS_FILES) {
-        out.push_str("- " );
+        out.push_str("- ");
         out.push_str(&display_relative(file, path));
         out.push('\n');
     }
     if files.len() > MAX_ANALYSIS_FILES {
-        out.push_str(&format!("- ... {} more files omitted from listing\n", files.len() - MAX_ANALYSIS_FILES));
+        out.push_str(&format!(
+            "- ... {} more files omitted from listing\n",
+            files.len() - MAX_ANALYSIS_FILES
+        ));
     }
-    out.push_str("\n");
+    out.push('\n');
 
     let mut remaining = MAX_ANALYSIS_CHARS.saturating_sub(out.len());
     let mut included = 0usize;
@@ -352,7 +559,10 @@ fn build_source_context(path: &Path) -> Result<String, std::io::Error> {
 
 fn build_file_context(path: &Path, budget: usize) -> Result<String, std::io::Error> {
     if !is_supported_source_file(path) {
-        return Ok(format!("Requested file is not a supported source type: {}", path.display()));
+        return Ok(format!(
+            "Requested file is not a supported source type: {}",
+            path.display()
+        ));
     }
     build_file_section(path, path.parent().unwrap_or_else(|| Path::new(".")), budget)
 }
@@ -406,7 +616,10 @@ fn collect_source_files_inner(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), 
 }
 
 fn should_skip_dir(name: &str) -> bool {
-    matches!(name, "target" | ".git" | "node_modules" | "dist" | "build" | "vendor" | ".idea" | ".vscode" | "__pycache__")
+    matches!(
+        name,
+        "target" | ".git" | "node_modules" | "dist" | "build" | "vendor" | ".idea" | ".vscode" | "__pycache__"
+    )
 }
 
 fn is_supported_source_file(path: &Path) -> bool {
@@ -417,14 +630,21 @@ fn is_supported_source_file(path: &Path) -> bool {
         return true;
     }
     matches!(
-        path.extension().and_then(|value| value.to_str()).unwrap_or_default().to_ascii_lowercase().as_str(),
+        path.extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
         "rs" | "toml" | "md" | "txt" | "asm" | "s" | "c" | "h" | "cpp" | "hpp" | "cc" | "cxx" | "json" | "yml" | "yaml"
     )
 }
 
 fn file_priority(path: &Path, root: &Path) -> (u8, String) {
     let rel = display_relative(path, root);
-    let name = path.file_name().and_then(|value| value.to_str()).unwrap_or_default();
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
     let score = match name {
         "Cargo.toml" => 0,
         "lib.rs" => 1,
@@ -446,7 +666,13 @@ fn display_relative(path: &Path, root: &Path) -> String {
 }
 
 fn code_fence_lang(path: &Path) -> &'static str {
-    match path.extension().and_then(|value| value.to_str()).unwrap_or_default().to_ascii_lowercase().as_str() {
+    match path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
         "rs" => "rust",
         "toml" => "toml",
         "md" => "markdown",
