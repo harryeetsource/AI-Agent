@@ -1,7 +1,7 @@
 mod init;
 mod input;
 mod render;
-
+use std::cmp::Reverse;
 use std::collections::BTreeSet;
 use std::env;
 use std::fmt::Write as _;
@@ -3038,7 +3038,25 @@ fn is_supported_analysis_file(path: &Path) -> bool {
         Some(ext) if matches!(ext.as_str(), "rs" | "toml" | "md" | "txt" | "asm" | "s" | "c" | "h" | "cpp" | "hpp" | "cc" | "cxx" | "json" | "yml" | "yaml")
     )
 }
+fn push_excerpt_window(
+    lines: &[&str],
+    selected: &mut Vec<String>,
+    start: usize,
+    end: usize,
+) {
+    let mut block = String::new();
 
+    for (idx, line) in lines[start.min(lines.len())..end.min(lines.len())]
+        .iter()
+        .enumerate()
+    {
+        block.push_str(&format!("{:>4}: {}\n", start + idx + 1, line));
+    }
+
+    if !block.trim().is_empty() && !selected.contains(&block) {
+        selected.push(block);
+    }
+}
 fn excerpt_file(path: &Path, query: &str, max_chars: usize) -> io::Result<String> {
     let content = fs::read_to_string(path)?;
     if content.len() <= max_chars {
@@ -3052,27 +3070,33 @@ fn excerpt_file(path: &Path, query: &str, max_chars: usize) -> io::Result<String
 
     let query_terms = query_terms(query);
     let mut selected = Vec::new();
-    let mut push_window = |start: usize, end: usize| {
-        let mut block = String::new();
-        for (idx, line) in lines[start.min(lines.len())..end.min(lines.len())].iter().enumerate() {
-            block.push_str(&format!("{:>4}: {}\n", start + idx + 1, line));
-        }
-        if !block.trim().is_empty() && !selected.contains(&block) {
-            selected.push(block);
-        }
-    };
 
-    push_window(0, 80);
+    push_excerpt_window(&lines, &mut selected, 0, 80);
 
-    let structural_needles = ["pub fn ", "fn ", "impl ", "struct ", "enum ", "trait ", "mod ", "unsafe", "match "];
+    let structural_needles = [
+        "pub fn ",
+        "fn ",
+        "impl ",
+        "struct ",
+        "enum ",
+        "trait ",
+        "mod ",
+        "unsafe",
+        "match ",
+    ];
+
     for (idx, line) in lines.iter().enumerate() {
         let lowercase = line.to_ascii_lowercase();
-        let structural_hit = structural_needles.iter().any(|needle| lowercase.contains(needle));
+        let structural_hit = structural_needles
+            .iter()
+            .any(|needle| lowercase.contains(needle));
         let query_hit = query_terms.iter().any(|term| lowercase.contains(term));
+
         if structural_hit || query_hit {
             let start = idx.saturating_sub(4);
             let end = (idx + 12).min(lines.len());
-            push_window(start, end);
+            push_excerpt_window(&lines, &mut selected, start, end);
+
             if selected.len() >= 8 {
                 break;
             }
@@ -3084,6 +3108,7 @@ fn excerpt_file(path: &Path, query: &str, max_chars: usize) -> io::Result<String
         excerpt.truncate(max_chars);
         excerpt.push_str("\n... [truncated]\n");
     }
+
     Ok(excerpt)
 }
 
