@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-MODEL_PATH="${1:-./data/models/qwen2.5-coder-1.5b-instruct-q4_k_m.gguf}"
+MODEL_PATH="${1:-./data/models/model.gguf}"
 SERVER_PATH="${CLAW_LLAMA_SERVER_PATH:-./runners/llama/llama-server}"
 HOST="${CLAW_LLAMA_HOST:-127.0.0.1}"
 PORT="${CLAW_LLAMA_PORT:-8081}"
