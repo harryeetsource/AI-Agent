@@ -1,347 +1,475 @@
-# Clawd
+# Claw Code (Offline Rewrite)
 
-`clawd` is the WebUI backend agent responsible for orchestrating conversations between the browser UI, the model runner, and the local tool runtime.
+This fork is configured for **local-only model execution**.
 
-Unlike a simple proxy, `clawd` executes tools locally and feeds results back into the model loop until a final response is produced.
+It does **not** require:
 
-This enables real analysis workflows such as:
+- Anthropic API keys
+- OAuth login
+- OpenAI-compatible schemas
+- cloud provider authentication
 
-- repository inspection
-- multi-file reading
-- semantic search
-- CLI tool execution
-- hook-driven policy enforcement
-- plugin-based tool expansion
+Instead, it uses:
 
----
-
-# Architecture Overview
-
-```text
-Browser UI
-    ↓
-POST /v1/messages
-    ↓
-clawd
-    ↓
-ConversationRuntime
-    ↓
-GlobalToolRegistry
-    ↓
-Tool Executor
-    ↓
-Hooks (Pre/Post)
-    ↓
-Tool Results
-    ↓
-Model Runner
-    ↓
-Final assistant response
-```
-
-The model does not hallucinate file contents. Instead, it invokes real tools which retrieve data from the local filesystem or other configured sources.
+- a **local model runner**
+- a **local daemon (`clawd`)**
+- a **local tool/runtime loop**
+- an optional **SQLite retrieval database**
 
 ---
 
-# Features
+## Quick Start
 
-## Tool Execution Loop
+### 1. Build the workspace
 
-`clawd` implements a full tool loop:
-
-1. Send user request to runner.
-2. Runner returns response blocks.
-3. Detect `tool_use` blocks.
-4. Execute tools locally.
-5. Append tool results to the conversation.
-6. Continue until a final assistant response is produced.
-
-This enables iterative reasoning workflows where the model can inspect multiple files before generating an answer.
-
-## Supported Tool Types
-
-### File system tools
-
-| Tool | Purpose |
-|------|---------|
-| `glob_search` | Find files matching patterns |
-| `grep_search` | Search inside files |
-| `read_file` | Read file contents |
-| `list_dir` | Directory inspection |
-
-### CLI tools
-
-Tools can execute local commands through the tool executor.
-
-Example use cases:
-
-- cargo metadata inspection
-- git queries
-- custom analysis binaries
-- language-specific parsers
-
-## Hook System
-
-Hooks allow inspection or modification of tool execution.
-
-Supported hook events:
-
-- `PreToolUse`
-- `PostToolUse`
-- `Stop`
-- `SubagentStop`
-
-Hooks can:
-
-- block tool execution
-- modify tool input
-- log tool usage
-- enforce policy constraints
-
-Hook runner:
-
-```rust
-hooks::HookRunner
-```
-
-Configured via:
-
-```text
-~/.claw/hooks.json
-```
-
-Example:
-
-```json
-{
-  "hooks": [
-    {
-      "event": "PreToolUse",
-      "command": "echo tool invoked"
-    }
-  ]
-}
-```
-
----
-
-# HTTP API
-
-## `POST /v1/messages`
-
-Primary conversation endpoint used by the WebUI.
-
-### Request
-
-```json
-{
-  "model": "runner",
-  "messages": [
-    {
-      "role": "user",
-      "content": [
-        {
-          "type": "text",
-          "text": "analyze my project"
-        }
-      ]
-    }
-  ]
-}
-```
-
-### Response
-
-```json
-{
-  "content": [
-    {
-      "type": "text",
-      "text": "Control flow overview..."
-    }
-  ]
-}
-```
-
-Tool calls are handled internally and are not exposed directly to the WebUI.
-
----
-
-# Configuration
-
-## Runner endpoint
-
-Default:
-
-```text
-http://127.0.0.1:11434/v1/messages
-```
-
-Configured in:
-
-```text
-src/main.rs
-```
-
-## Hooks directory
-
-Default:
-
-```text
-~/.claw/hooks.json
-```
-
-Example:
-
-```json
-{
-  "hooks": [
-    {
-      "event": "PreToolUse",
-      "command": "echo tool invoked"
-    }
-  ]
-}
-```
-
----
-
-# Build
-
-Build `clawd`:
+From the `rust/` directory:
 
 ```bash
-cargo build -p clawd
-```
-
-Build the full workspace:
-
-```bash
-cargo build --workspace
-```
-
-Release build:
-
-```bash
-cargo build -p clawd --release
+cargo build --workspace --release
 ```
 
 ---
 
-# Running
+### 2. Install SQLite (required for local retrieval DB)
 
-Start runner:
+If you plan to use the retrieval/indexing workflow, you need the `sqlite3` CLI installed and available in your `PATH`. The project’s offline docs already depend on `sqlite3 data/db/knowledge.db` for DB creation. 
+
+#### Windows
+
+1. Download the SQLite tools bundle from the official SQLite download page.
+2. Extract `sqlite3.exe` to a permanent location such as:
 
 ```text
-runner daemon
+C:\Tools\sqlite\
 ```
 
-Start `clawd`:
+3. Add that directory to your system `PATH`.
+4. Verify:
+
+```powershell
+sqlite3 --version
+```
+
+#### Linux
+
+```bash
+sudo apt install sqlite3
+```
+
+#### macOS
+
+```bash
+brew install sqlite
+```
+
+Without `sqlite3`, local DB initialization and indexing will fail. :contentReference[oaicite:1]{index=1}
+
+---
+
+### 3. Place your local model and runner binaries
+
+Expected layout from the offline setup notes:
+
+```text
+rust/
+├── data/
+│   ├── models/
+│   │   └── qwen2.5-coder-1.5b-instruct-q4_k_m.gguf
+│   ├── knowledge.db
+│   └── corpus/
+│       ├── rust/
+│       ├── asm/
+│       └── docs/
+├── runners/
+│   └── llama/
+│       ├── llama-server.exe
+│       └── llama-cli.exe
+├── scripts/
+└── .env.example
+``` 
+
+This layout is explicitly described in the offline setup notes. :contentReference[oaicite:2]{index=2}
+
+---
+
+### 4. Initialize the SQLite database
+
+If your project includes the helper scripts, use them:
+
+#### PowerShell
+
+```powershell
+.\scripts\init-knowledge-db.ps1
+```
+
+#### Bash
+
+```bash
+./scripts/init-knowledge-db.sh
+```
+
+If you need to create it manually:
+
+```bash
+sqlite3 data/db/knowledge.db <<'SQL'
+CREATE TABLE IF NOT EXISTS documents (
+    id INTEGER PRIMARY KEY,
+    path TEXT NOT NULL UNIQUE,
+    kind TEXT NOT NULL,
+    sha256 TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS chunks (
+    id INTEGER PRIMARY KEY,
+    document_id INTEGER NOT NULL,
+    chunk_index INTEGER NOT NULL,
+    text TEXT NOT NULL,
+    FOREIGN KEY(document_id) REFERENCES documents(id)
+);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+    text,
+    content='chunks',
+    content_rowid='id'
+);
+
+CREATE TABLE IF NOT EXISTS sessions (
+    id INTEGER PRIMARY KEY,
+    session_key TEXT NOT NULL UNIQUE,
+    summary TEXT,
+    transcript_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS tool_results (
+    id INTEGER PRIMARY KEY,
+    tool_name TEXT NOT NULL,
+    input_json TEXT NOT NULL,
+    output_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+SQL
+```
+
+That schema is based on the offline rewrite notes. 
+
+---
+
+### 5. Start the local model runner
+
+Your local runner must accept native Claw `MessageRequest` JSON and return native Claw `MessageResponse` JSON. The API types support:
+
+- `tools`
+- `tool_choice`
+- `tool_use`
+- `tool_result`
+
+through the native request/response schema. 
+
+The current `clawd` daemon defaults to:
+
+- **daemon host:** `127.0.0.1`
+- **daemon port:** `8080`
+- **runner base URL:** `http://127.0.0.1:8081`
+- **runner messages path:** `/v1/messages` :contentReference[oaicite:5]{index=5}
+
+So your normal startup flow is:
+
+#### PowerShell
+
+```powershell
+.\scripts\run-llama.ps1
+```
+
+#### Bash
+
+```bash
+./scripts/run-llama.sh
+```
+
+If you start the runner manually, make sure it serves:
+
+```text
+http://127.0.0.1:8081/v1/messages
+```
+
+---
+
+### 6. Start `clawd`
+
+From `rust/`:
 
 ```bash
 cargo run -p clawd
 ```
 
-Start WebUI:
+By default, `clawd` serves the Web UI backend on:
+
+```text
+http://127.0.0.1:8080
+```
+
+and forwards model requests to the runner at:
+
+```text
+http://127.0.0.1:8081/v1/messages
+```
+
+Those defaults come directly from the current daemon source. :contentReference[oaicite:6]{index=6}
+
+---
+
+### 7. Start the CLI (optional)
+
+The CLI binary is `claw`. The current CLI help/output path is in `rusty-claude-cli`, and the default model aliases resolve to local Qwen variants rather than cloud models. For example:
+
+- `opus` → `qwen2.5-coder:32b`
+- `sonnet` → `qwen2.5-coder:14b`
+- `haiku` → `qwen2.5-coder:7b` :contentReference[oaicite:7]{index=7}
+
+Run the REPL:
 
 ```bash
-npm install
-npm run dev
+cargo run -p rusty-claude-cli --
 ```
 
-Open:
-
-```text
-http://localhost:3000
-```
-
----
-
-# Example Workflow
-
-User request:
-
-```text
-analyze my source code and give me an overview of control flow:
-
-C:\repo\floatpack\src
-```
-
-Tool sequence:
-
-1. `glob_search`
-2. `read_file` on entry points like `main.rs` or `lib.rs`
-3. `grep_search` for function references
-4. `read_file` on dependent modules
-5. summarize control flow
-
-Final output is synthesized from real source files.
-
----
-
-# Troubleshooting
-
-## WebUI shows "Runner Unknown"
-
-Verify runner is running:
+Run a one-shot prompt:
 
 ```bash
-curl http://127.0.0.1:11434/v1/messages
+cargo run -p rusty-claude-cli -- prompt "summarize this repo"
 ```
 
-## No tools executing
-
-Verify the tool registry is initialized:
-
-```rust
-GlobalToolRegistry::default()
-```
-
-## Hooks not firing
-
-Check:
-
-```text
-~/.claw/hooks.json
-```
-
-Ensure valid JSON format.
-
-## Requests not reaching backend
-
-Check the browser console for:
-
-```text
-POST /v1/messages
-```
-
-Ensure the request returns HTTP 200.
+The CLI help and usage flow are defined in the current CLI source. :contentReference[oaicite:8]{index=8}
 
 ---
 
-# Development Notes
+## Current Runtime Topology
 
-Key modules:
+The current offline stack is:
 
 ```text
-ConversationRuntime
-GlobalToolRegistry
-CliToolExecutor
-HookRunner
+Browser / Web UI
+    ↓
+clawd (127.0.0.1:8080)
+    ↓
+local runner (127.0.0.1:8081/v1/messages)
+    ↓
+tool loop / hooks / plugins / runtime
 ```
 
-The WebUI backend should not directly forward requests to the runner without executing the tool loop.
+The daemon currently exposes:
+
+- `/`
+- `/static/app.js`
+- `/static/styles.css`
+- `/health`
+- `/v1/messages` :contentReference[oaicite:9]{index=9}
+
+The Web UI posts directly to `/v1/messages` with a native `MessageRequest` payload and `stream: false`. :contentReference[oaicite:10]{index=10}
 
 ---
 
-# Summary
+## Tooling and Agent Loop
 
-`clawd` acts as the orchestration layer between:
+The project already has native tool schemas and tool-capable message types:
 
-- WebUI
-- model runner
-- local tools
-- hooks
-- plugins
+### Request capabilities
 
-It ensures the model can iteratively inspect local resources before producing responses.
+`MessageRequest` supports:
+
+- `model`
+- `messages`
+- `system`
+- `tools`
+- `tool_choice`
+- `stream` :contentReference[oaicite:11]{index=11}
+
+### Response capabilities
+
+`MessageResponse` supports `OutputContentBlock`, including:
+
+- `Text`
+- `ToolUse`
+- `Thinking`
+- `RedactedThinking` :contentReference[oaicite:12]{index=12}
+
+### Built-in tools
+
+The current tool registry includes tools such as:
+
+- `bash`
+- `read_file`
+- `write_file`
+- `edit_file`
+- `glob_search`
+- `grep_search`
+- `WebFetch`
+- `WebSearch`
+- `TodoWrite`
+- `Skill`
+- `Agent`
+- `ToolSearch`
+- `NotebookEdit`
+- `Sleep`
+- `SendUserMessage`
+- `Config`
+- `StructuredOutput`
+- `REPL`
+- `PowerShell` 
+
+### Hooks
+
+The hook system already supports:
+
+- `PreToolUse`
+- `PostToolUse`
+
+and can:
+
+- allow tool execution
+- deny tool execution
+- emit warning messages
+- attach extra output text 
+
+---
+
+## Optional Retrieval / Corpus Workflow
+
+The offline rewrite notes recommend three local inputs:
+
+1. a local model daemon
+2. a local SQLite retrieval DB
+3. a local corpus directory :contentReference[oaicite:15]{index=15}
+
+Recommended corpus root:
+
+```text
+data/corpus/
+```
+
+Recommended contents:
+
+- this Claw workspace
+- Rust source and notes
+- assembly references
+- curated bug-fix examples
+- local markdown design notes :contentReference[oaicite:16]{index=16}
+
+Desktop-friendly guidance from the notes:
+
+- your own repo and docs first
+- curated Rust/assembly examples second
+- SQLite FTS retrieval instead of massive raw datasets :contentReference[oaicite:17]{index=17}
+
+---
+
+## Common Commands
+
+### Build everything
+
+```bash
+cargo build --workspace --release
+```
+
+### Run the daemon
+
+```bash
+cargo run -p clawd
+```
+
+### Run the CLI REPL
+
+```bash
+cargo run -p rusty-claude-cli --
+```
+
+### Run a one-shot prompt
+
+```bash
+cargo run -p rusty-claude-cli -- prompt "summarize this repo"
+```
+
+### Initialize the retrieval DB (PowerShell)
+
+```powershell
+.\scripts\init-knowledge-db.ps1
+```
+
+### Launch the local runner (PowerShell)
+
+```powershell
+.\scripts\run-llama.ps1
+```
+
+---
+
+## Troubleshooting
+
+### `sqlite3` is not recognized
+
+Install SQLite and add `sqlite3.exe` to your `PATH`, then verify:
+
+```powershell
+sqlite3 --version
+```
+
+This is required for DB initialization and indexing. :contentReference[oaicite:18]{index=18}
+
+---
+
+### `clawd` is running but Web UI shows runner problems
+
+Check the daemon defaults:
+
+- daemon: `127.0.0.1:8080`
+- runner: `127.0.0.1:8081/v1/messages` :contentReference[oaicite:19]{index=19}
+
+Verify the runner directly:
+
+```powershell
+Invoke-WebRequest http://127.0.0.1:8081/v1/messages -Method POST -ContentType "application/json" -Body '{"model":"local","max_tokens":16,"messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}],"stream":false}'
+```
+
+---
+
+### The model gives generic “I cannot access your files” answers
+
+That means the current path is still not using the tool-capable runtime loop properly, even though the schema, tool registry, and hook runner all exist in the codebase. The current Web UI request builder does send native requests to `/v1/messages`, but by itself that does not guarantee that tool execution is happening. 
+
+---
+
+## Workspace Overview
+
+The offline notes describe the workspace direction as:
+
+- `crates/api/` — local model transport and request/response types
+- `crates/runtime/` — conversation runtime, sessions, permissions, prompts
+- `crates/tools/` — tool registry and subagent support
+- `crates/rusty-claude-cli/` — main CLI binary (`claw`) :contentReference[oaicite:21]{index=21}
+
+The current CLI/runtime/tool source you uploaded matches that architecture:
+- local Qwen defaults in the CLI/runtime path :contentReference[oaicite:22]{index=22}
+- tool execution through `GlobalToolRegistry` and `CliToolExecutor` :contentReference[oaicite:23]{index=23}
+- hook execution through the hook runner :contentReference[oaicite:24]{index=24}
+
+---
+
+## Summary
+
+This repo is intended to run:
+
+- **fully offline**
+- with a **local runner**
+- with a **local daemon**
+- with **native tool calls**
+- with an optional **SQLite-backed retrieval layer**
+
+The key startup points are:
+
+- `clawd` on **127.0.0.1:8080**
+- local runner on **127.0.0.1:8081/v1/messages**
+- optional SQLite retrieval via `sqlite3`
+- CLI via `cargo run -p rusty-claude-cli --`
+
+That setup is consistent with the current daemon defaults and the offline rewrite documentation. 
