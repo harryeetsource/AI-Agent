@@ -10,4 +10,4 @@ export CLAWD_HOST="${CLAWD_HOST:-127.0.0.1}"
 export CLAWD_PORT="${CLAWD_PORT:-8080}"
 export CLAW_LOCAL_BASE_URL="http://${CLAWD_HOST}:${CLAWD_PORT}"
 
-exec "$REPO_ROOT/releases/clawd"
+exec "$REPO_ROOT/target/releases/clawd"
