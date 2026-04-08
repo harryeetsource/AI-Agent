@@ -26,12 +26,13 @@ const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_PORT: u16 = 8080;
 const DEFAULT_RUNNER_BASE_URL: &str = "http://127.0.0.1:8081";
 const DEFAULT_RUNNER_MESSAGES_PATH: &str = "/v1/messages";
-const MAX_FALLBACK_FILES: usize = 8;
-const MAX_FALLBACK_FILE_CHARS: usize = 4000;
-const MAX_FALLBACK_TOTAL_CHARS: usize = 18000;
-const MAX_TOOL_ROUNDS: usize = 3;
+
+const MAX_FALLBACK_FILES: usize = 5;
+const MAX_FALLBACK_FILE_CHARS: usize = 2500;
+const MAX_FALLBACK_TOTAL_CHARS: usize = 9000;
+const MAX_TOOL_ROUNDS: usize = 1;
 const MAX_SUMMARY_FILES: usize = 12;
-const MAX_TOOL_OUTPUT_CHARS: usize = 6000;
+const MAX_TOOL_OUTPUT_CHARS: usize = 4000;
 
 #[derive(Clone)]
 struct AppState {
@@ -185,6 +186,7 @@ async fn messages(
         }
     }
 }
+
 fn request_needs_repo_analysis(request: &MessageRequest) -> bool {
     let Some(text) = latest_user_text(request) else {
         return false;
@@ -205,6 +207,8 @@ fn request_needs_repo_analysis(request: &MessageRequest) -> bool {
             "entry point",
             "entrypoint",
             "rust code",
+            "files that you reviewed",
+            "important modules",
         ]
         .iter()
         .any(|term| lower.contains(term))
@@ -240,8 +244,8 @@ fn build_repo_fallback_context_for_path(path: &Path) -> Result<String, std::io::
 
         if rel == "Cargo.toml"
             || rel_lower.ends_with("/cargo.toml")
-            || rel_lower.ends_with("/main.rs")
-            || rel_lower.ends_with("/lib.rs")
+            || rel_lower.ends_with("/src/main.rs")
+            || rel_lower.ends_with("/src/lib.rs")
             || rel_lower.ends_with("/mod.rs")
         {
             selected.push(file.clone());
@@ -278,9 +282,7 @@ fn build_repo_fallback_context_for_path(path: &Path) -> Result<String, std::io::
         let content = fs::read_to_string(&file)?;
 
         let snippet = truncate_chars(&content, MAX_FALLBACK_FILE_CHARS.min(remaining));
-        let section = format!(
-            "FILE: {rel}\n```{lang}\n{snippet}\n```\n\n"
-        );
+        let section = format!("FILE: {rel}\n```{lang}\n{snippet}\n```\n\n");
 
         remaining = remaining.saturating_sub(section.len());
         out.push_str(&section);
@@ -301,6 +303,7 @@ fn build_single_file_fallback(path: &Path) -> Result<String, std::io::Error> {
         snippet
     ))
 }
+
 fn code_fence_lang(path: &Path) -> &'static str {
     match path
         .extension()
@@ -331,6 +334,7 @@ fn code_fence_lang(path: &Path) -> &'static str {
         _ => "",
     }
 }
+
 fn truncate_chars(text: &str, max_chars: usize) -> String {
     if text.chars().count() <= max_chars {
         return text.to_string();
@@ -354,7 +358,7 @@ fn build_fallback_synthesis_request(
     req.tool_choice = None;
 
     let synthesis = format!(
-        "You were unable to use structured tool calls reliably, so you are being given a bounded local repository snapshot.\n\
+        "You are being given a bounded local repository snapshot for analysis.\n\
 Analyze the Rust codebase based only on the provided files.\n\
 Give:\n\
 1. the important modules\n\
@@ -376,6 +380,7 @@ REPOSITORY SNAPSHOT\n\
 
     req
 }
+
 async fn process_message_request(
     state: &AppState,
     request: &MessageRequest,
@@ -387,7 +392,7 @@ async fn process_message_request(
 
     runner_request.stream = false;
 
-    if should_enable_tools(request) {
+    if should_enable_tools(request) && !wants_repo_analysis {
         let tool_specs = filtered_tool_specs(&state.tool_registry);
         if !tool_specs.is_empty() {
             runner_request.tools = Some(tool_specs);
@@ -397,7 +402,7 @@ async fn process_message_request(
         }
     }
 
-    for round in 0..MAX_TOOL_ROUNDS {
+    for _round in 0..MAX_TOOL_ROUNDS {
         let response = call_runner(state, &runner_request).await?;
         let tool_uses = extract_tool_uses(&response);
 
@@ -405,41 +410,24 @@ async fn process_message_request(
             let fake_plan = looks_like_fake_tool_plan(&response);
 
             if require_tool_use && !saw_real_tool_use {
-                if round + 1 >= MAX_TOOL_ROUNDS {
-                    if wants_repo_analysis {
-                        if let Some(fallback_context) = build_repo_fallback_context(request) {
-                            if !fallback_context.trim().is_empty() {
-                                let fallback_request =
-                                    build_fallback_synthesis_request(request, &fallback_context);
-                                return call_runner(state, &fallback_request).await;
-                            }
+                if wants_repo_analysis {
+                    if let Some(fallback_context) = build_repo_fallback_context(request) {
+                        if !fallback_context.trim().is_empty() {
+                            let fallback_request =
+                                build_fallback_synthesis_request(request, &fallback_context);
+                            return call_runner(state, &fallback_request).await;
                         }
                     }
-
-                    if fake_plan {
-                        return Err(std::io::Error::other(
-                            "model failed to emit real tool calls; it only produced a textual tool plan",
-                        )
-                        .into());
-                    }
-
-                    return Ok(response);
                 }
 
-                let retry_text = if fake_plan {
-                    "You did not emit actual tool calls. Do not describe a plan. Do not print JSON examples. Immediately emit real tool calls now."
-                } else {
-                    "You have not used tools yet. Do not describe a plan. Do not print JSON. Use actual tool calls now to inspect the referenced path, then continue the analysis."
-                };
+                if fake_plan {
+                    return Err(std::io::Error::other(
+                        "model failed to emit real tool calls; it only produced a textual tool plan",
+                    )
+                    .into());
+                }
 
-                runner_request.messages.push(InputMessage {
-                    role: "user".to_string(),
-                    content: vec![InputContentBlock::Text {
-                        text: retry_text.to_string(),
-                    }],
-                });
-
-                continue;
+                return Ok(response);
             }
 
             return Ok(response);
@@ -584,7 +572,9 @@ fn output_blocks_to_input_message(blocks: &[OutputContentBlock]) -> Option<Input
                     input: input.clone(),
                 })
             }
-            OutputContentBlock::Thinking { .. } | OutputContentBlock::RedactedThinking { .. } => None,
+            OutputContentBlock::Thinking { .. } | OutputContentBlock::RedactedThinking { .. } => {
+                None
+            }
         })
         .collect::<Vec<_>>();
 
@@ -679,18 +669,10 @@ fn maybe_enrich_request_with_local_sources(request: &MessageRequest) -> MessageR
 
     let analysis_instructions = format!(
         "The user referenced a real filesystem path.\n\
-You MUST emit actual tool calls before writing any analysis.\n\
-Do NOT describe your plan.\n\
-Do NOT explain what you will inspect.\n\
-Do NOT print JSON.\n\
-Do NOT list intended files.\n\
-Your first response must be one or more real tool calls.\n\n\
-Use this workflow:\n\
-1. glob_search for Cargo.toml, main.rs, lib.rs, mod.rs\n\
-2. grep_search for fn main, pub fn, impl, trait, enum, struct, unsafe\n\
-3. read_file only for the highest-value files found\n\
-4. then analyze control flow\n\n\
-If a real path is present, never answer from guesswork.\n\n\
+Do not guess about the repository contents.\n\
+If tools are available and useful, use them conservatively.\n\
+Do not request the entire repository at once.\n\
+Prefer bounded inspection of entry points and major modules.\n\n\
 LOCAL PATH SUMMARY\n\
 ==================\n\
 {summary}"
@@ -922,6 +904,7 @@ fn truncate_tool_output(output: &str, max_chars: usize) -> String {
     truncated.push_str("\n... [tool output truncated] ...");
     truncated
 }
+
 fn should_enable_tools(request: &MessageRequest) -> bool {
     let Some(text) = latest_user_text(request) else {
         return false;
@@ -938,28 +921,19 @@ fn should_enable_tools(request: &MessageRequest) -> bool {
         "glob_search",
         "grep_search",
         "inspect",
-        "analyze",
-        "analysis",
-        "repository",
-        "repo",
-        "directory",
-        "codebase",
-        "workspace",
-        "src/",
-        "cargo.toml",
-        "find files",
-        "search files",
-        "open file",
-        "read file",
-        "edit file",
-        "write file",
         "bash",
         "powershell",
+        "edit file",
+        "write file",
+        "open file",
+        "search files",
+        "find files",
         "command",
     ];
 
     toolish_terms.iter().any(|term| lower.contains(term))
 }
+
 fn looks_like_fake_tool_plan(response: &MessageResponse) -> bool {
     let combined = response
         .content
