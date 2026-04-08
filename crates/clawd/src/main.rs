@@ -27,7 +27,7 @@ const DEFAULT_PORT: u16 = 8080;
 const DEFAULT_RUNNER_BASE_URL: &str = "http://127.0.0.1:8081";
 const DEFAULT_RUNNER_MESSAGES_PATH: &str = "/v1/messages";
 
-const MAX_TOOL_ROUNDS: usize = 12;
+const MAX_TOOL_ROUNDS: usize = 3;
 const MAX_SUMMARY_FILES: usize = 12;
 const MAX_TOOL_OUTPUT_CHARS: usize = 6000;
 
@@ -207,19 +207,29 @@ async fn process_message_request(
         let tool_uses = extract_tool_uses(&response);
 
         if tool_uses.is_empty() {
+            let fake_plan = looks_like_fake_tool_plan(&response);
+
             if require_tool_use && !saw_real_tool_use {
                 if round + 1 >= MAX_TOOL_ROUNDS {
+                    if fake_plan {
+                        return Err(std::io::Error::other(
+                            "model failed to emit real tool calls; it only produced a textual tool plan",
+                        )
+                        .into());
+                    }
                     return Ok(response);
                 }
+
+                let retry_text = if fake_plan {
+                    "You did not emit actual tool calls. Do not describe a plan. Do not print JSON examples. Immediately emit real tool calls now."
+                } else {
+                    "You have not used tools yet. Do not describe a plan. Do not print JSON. Use actual tool calls now to inspect the referenced path, then continue the analysis."
+                };
 
                 runner_request.messages.push(InputMessage {
                     role: "user".to_string(),
                     content: vec![InputContentBlock::Text {
-                        text: String::from(
-                            "You have not used tools yet. Do not describe a plan. \
-Do not print JSON. Use actual tool calls now to inspect the referenced path, \
-then continue the analysis.",
-                        ),
+                        text: retry_text.to_string(),
                     }],
                 });
 
@@ -358,9 +368,7 @@ fn output_blocks_to_input_message(blocks: &[OutputContentBlock]) -> Option<Input
                     input: input.clone(),
                 })
             }
-            OutputContentBlock::Thinking { .. } | OutputContentBlock::RedactedThinking { .. } => {
-                None
-            }
+            OutputContentBlock::Thinking { .. } | OutputContentBlock::RedactedThinking { .. } => None,
         })
         .collect::<Vec<_>>();
 
@@ -455,26 +463,18 @@ fn maybe_enrich_request_with_local_sources(request: &MessageRequest) -> MessageR
 
     let analysis_instructions = format!(
         "The user referenced a real filesystem path.\n\
-You MUST use actual tool calls before writing analysis.\n\
+You MUST emit actual tool calls before writing any analysis.\n\
 Do NOT describe your plan.\n\
-Do NOT print JSON.\n\
-Do NOT list files you intend to read.\n\
 Do NOT explain what you will inspect.\n\
-Immediately emit real tool calls.\n\n\
-Required workflow:\n\
-1. Use glob_search and grep_search to identify the true entry points and important modules.\n\
-2. Use read_file on only the most relevant files first.\n\
-3. After reading initial files, continue with at least one follow-up pass to resolve cross-module control flow.\n\
-4. Only after actual inspection, produce a grounded analysis.\n\
-5. Every conclusion must be based on real inspected files.\n\n\
-When analyzing a Rust codebase, prioritize:\n\
-- Cargo.toml\n\
-- src/main.rs\n\
-- src/lib.rs\n\
-- mod.rs files\n\
-- files referenced by module declarations\n\
-- files containing fn main, pub fn, impl, trait, enum, struct, unsafe\n\n\
-Do NOT request the entire repository at once.\n\n\
+Do NOT print JSON.\n\
+Do NOT list intended files.\n\
+Your first response must be one or more real tool calls.\n\n\
+Use this workflow:\n\
+1. glob_search for Cargo.toml, main.rs, lib.rs, mod.rs\n\
+2. grep_search for fn main, pub fn, impl, trait, enum, struct, unsafe\n\
+3. read_file only for the highest-value files found\n\
+4. then analyze control flow\n\n\
+If a real path is present, never answer from guesswork.\n\n\
 LOCAL PATH SUMMARY\n\
 ==================\n\
 {summary}"
@@ -705,6 +705,28 @@ fn truncate_tool_output(output: &str, max_chars: usize) -> String {
     }
     truncated.push_str("\n... [tool output truncated] ...");
     truncated
+}
+
+fn looks_like_fake_tool_plan(response: &MessageResponse) -> bool {
+    let combined = response
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            OutputContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let lower = combined.to_ascii_lowercase();
+
+    (lower.contains("\"name\": \"glob_search\"")
+        || lower.contains("\"name\": \"grep_search\"")
+        || lower.contains("\"name\": \"read_file\"")
+        || lower.contains("let's start by")
+        || lower.contains("i'll start by")
+        || lower.contains("once we have identified these files"))
+        && !combined.trim().is_empty()
 }
 
 fn normalize_base_url(value: String) -> String {
