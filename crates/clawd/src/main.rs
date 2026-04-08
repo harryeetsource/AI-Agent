@@ -26,7 +26,9 @@ const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_PORT: u16 = 8080;
 const DEFAULT_RUNNER_BASE_URL: &str = "http://127.0.0.1:8081";
 const DEFAULT_RUNNER_MESSAGES_PATH: &str = "/v1/messages";
-
+const MAX_FALLBACK_FILES: usize = 8;
+const MAX_FALLBACK_FILE_CHARS: usize = 4000;
+const MAX_FALLBACK_TOTAL_CHARS: usize = 18000;
 const MAX_TOOL_ROUNDS: usize = 3;
 const MAX_SUMMARY_FILES: usize = 12;
 const MAX_TOOL_OUTPUT_CHARS: usize = 6000;
@@ -183,22 +185,215 @@ async fn messages(
         }
     }
 }
+fn request_needs_repo_analysis(request: &MessageRequest) -> bool {
+    let Some(text) = latest_user_text(request) else {
+        return false;
+    };
 
+    let lower = text.to_ascii_lowercase();
+
+    detect_existing_path(&text).is_some()
+        && [
+            "analyze",
+            "analysis",
+            "control flow",
+            "overview",
+            "repository",
+            "repo",
+            "codebase",
+            "module",
+            "entry point",
+            "entrypoint",
+            "rust code",
+        ]
+        .iter()
+        .any(|term| lower.contains(term))
+}
+
+fn build_repo_fallback_context(request: &MessageRequest) -> Option<String> {
+    let user_text = latest_user_text(request)?;
+    let target_path = detect_existing_path(&user_text)?;
+    build_repo_fallback_context_for_path(&target_path).ok()
+}
+
+fn build_repo_fallback_context_for_path(path: &Path) -> Result<String, std::io::Error> {
+    if path.is_file() {
+        return build_single_file_fallback(path);
+    }
+
+    if !path.is_dir() {
+        return Ok(String::new());
+    }
+
+    let mut files = collect_source_files(path)?;
+    if files.is_empty() {
+        return Ok(String::new());
+    }
+
+    files.sort_by_key(|file| file_priority(file, path));
+
+    let mut selected = Vec::new();
+
+    for file in &files {
+        let rel = display_relative(file, path);
+        let rel_lower = rel.to_ascii_lowercase();
+
+        if rel == "Cargo.toml"
+            || rel_lower.ends_with("/cargo.toml")
+            || rel_lower.ends_with("/main.rs")
+            || rel_lower.ends_with("/lib.rs")
+            || rel_lower.ends_with("/mod.rs")
+        {
+            selected.push(file.clone());
+        }
+
+        if selected.len() >= MAX_FALLBACK_FILES {
+            break;
+        }
+    }
+
+    if selected.is_empty() {
+        selected.extend(files.into_iter().take(MAX_FALLBACK_FILES));
+    }
+
+    let mut out = String::new();
+    out.push_str(&format!("Repository root: {}\n\n", path.display()));
+    out.push_str("Selected files:\n");
+    for file in &selected {
+        out.push_str("- ");
+        out.push_str(&display_relative(file, path));
+        out.push('\n');
+    }
+    out.push('\n');
+
+    let mut remaining = MAX_FALLBACK_TOTAL_CHARS.saturating_sub(out.len());
+
+    for file in selected {
+        if remaining < 512 {
+            break;
+        }
+
+        let rel = display_relative(&file, path);
+        let lang = code_fence_lang(&file);
+        let content = fs::read_to_string(&file)?;
+
+        let snippet = truncate_chars(&content, MAX_FALLBACK_FILE_CHARS.min(remaining));
+        let section = format!(
+            "FILE: {rel}\n```{lang}\n{snippet}\n```\n\n"
+        );
+
+        remaining = remaining.saturating_sub(section.len());
+        out.push_str(&section);
+    }
+
+    Ok(out)
+}
+
+fn build_single_file_fallback(path: &Path) -> Result<String, std::io::Error> {
+    let lang = code_fence_lang(path);
+    let content = fs::read_to_string(path)?;
+    let snippet = truncate_chars(&content, MAX_FALLBACK_FILE_CHARS);
+
+    Ok(format!(
+        "Requested file: {}\n\n```{}\n{}\n```\n",
+        path.display(),
+        lang,
+        snippet
+    ))
+}
+fn code_fence_lang(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "rs" => "rust",
+        "toml" => "toml",
+        "json" => "json",
+        "yaml" | "yml" => "yaml",
+        "md" => "markdown",
+        "txt" => "text",
+        "lock" => "toml",
+        "sh" => "bash",
+        "ps1" => "powershell",
+        "c" => "c",
+        "h" => "c",
+        "cpp" | "cc" | "cxx" => "cpp",
+        "hpp" => "cpp",
+        "py" => "python",
+        "js" => "javascript",
+        "ts" => "typescript",
+        "go" => "go",
+        "java" => "java",
+        "cs" => "csharp",
+        _ => "",
+    }
+}
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+
+    let mut out = String::new();
+    for ch in text.chars().take(max_chars) {
+        out.push(ch);
+    }
+    out.push_str("\n/* ... truncated ... */");
+    out
+}
+
+fn build_fallback_synthesis_request(
+    request: &MessageRequest,
+    fallback_context: &str,
+) -> MessageRequest {
+    let mut req = request.clone();
+    req.stream = false;
+    req.tools = None;
+    req.tool_choice = None;
+
+    let synthesis = format!(
+        "You were unable to use structured tool calls reliably, so you are being given a bounded local repository snapshot.\n\
+Analyze the Rust codebase based only on the provided files.\n\
+Give:\n\
+1. the important modules\n\
+2. likely entry points\n\
+3. control flow between major files/modules\n\
+4. the files reviewed and each file's role\n\n\
+REPOSITORY SNAPSHOT\n\
+===================\n\
+{fallback_context}"
+    );
+
+    match &mut req.system {
+        Some(system) => {
+            system.push_str("\n\n");
+            system.push_str(&synthesis);
+        }
+        None => req.system = Some(synthesis),
+    }
+
+    req
+}
 async fn process_message_request(
     state: &AppState,
     request: &MessageRequest,
 ) -> Result<MessageResponse, Box<dyn std::error::Error + Send + Sync>> {
     let mut runner_request = maybe_enrich_request_with_local_sources(request);
     let require_tool_use = request_has_local_path(request);
+    let wants_repo_analysis = request_needs_repo_analysis(request);
     let mut saw_real_tool_use = false;
 
     runner_request.stream = false;
 
-    let tool_specs = filtered_tool_specs(&state.tool_registry);
-    if !tool_specs.is_empty() {
-        runner_request.tools = Some(tool_specs);
-        if runner_request.tool_choice.is_none() {
-            runner_request.tool_choice = Some(ToolChoice::Auto);
+    if should_enable_tools(request) {
+        let tool_specs = filtered_tool_specs(&state.tool_registry);
+        if !tool_specs.is_empty() {
+            runner_request.tools = Some(tool_specs);
+            if runner_request.tool_choice.is_none() {
+                runner_request.tool_choice = Some(ToolChoice::Auto);
+            }
         }
     }
 
@@ -211,12 +406,23 @@ async fn process_message_request(
 
             if require_tool_use && !saw_real_tool_use {
                 if round + 1 >= MAX_TOOL_ROUNDS {
+                    if wants_repo_analysis {
+                        if let Some(fallback_context) = build_repo_fallback_context(request) {
+                            if !fallback_context.trim().is_empty() {
+                                let fallback_request =
+                                    build_fallback_synthesis_request(request, &fallback_context);
+                                return call_runner(state, &fallback_request).await;
+                            }
+                        }
+                    }
+
                     if fake_plan {
                         return Err(std::io::Error::other(
                             "model failed to emit real tool calls; it only produced a textual tool plan",
                         )
                         .into());
                     }
+
                     return Ok(response);
                 }
 
@@ -287,6 +493,16 @@ async fn process_message_request(
                 output,
                 is_error,
             ));
+        }
+    }
+
+    if wants_repo_analysis {
+        if let Some(fallback_context) = build_repo_fallback_context(request) {
+            if !fallback_context.trim().is_empty() {
+                let fallback_request =
+                    build_fallback_synthesis_request(request, &fallback_context);
+                return call_runner(state, &fallback_request).await;
+            }
         }
     }
 
@@ -706,7 +922,44 @@ fn truncate_tool_output(output: &str, max_chars: usize) -> String {
     truncated.push_str("\n... [tool output truncated] ...");
     truncated
 }
+fn should_enable_tools(request: &MessageRequest) -> bool {
+    let Some(text) = latest_user_text(request) else {
+        return false;
+    };
 
+    let lower = text.to_ascii_lowercase();
+
+    if detect_existing_path(&text).is_some() {
+        return true;
+    }
+
+    let toolish_terms = [
+        "read_file",
+        "glob_search",
+        "grep_search",
+        "inspect",
+        "analyze",
+        "analysis",
+        "repository",
+        "repo",
+        "directory",
+        "codebase",
+        "workspace",
+        "src/",
+        "cargo.toml",
+        "find files",
+        "search files",
+        "open file",
+        "read file",
+        "edit file",
+        "write file",
+        "bash",
+        "powershell",
+        "command",
+    ];
+
+    toolish_terms.iter().any(|term| lower.contains(term))
+}
 fn looks_like_fake_tool_plan(response: &MessageResponse) -> bool {
     let combined = response
         .content
