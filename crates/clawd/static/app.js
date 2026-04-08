@@ -15,13 +15,40 @@ const state = {
   wrapCode: true,
 };
 
-function cloneMessageCard(role) {
+function formatClockTimestamp(date = new Date()) {
+  return date.toLocaleTimeString([], {
+    hour: 'numeric',
+    minute: '2-digit',
+    second: '2-digit',
+  });
+}
+
+function formatDurationMs(durationMs) {
+  const totalSeconds = Math.max(0, Math.round(durationMs / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+
+  if (minutes > 0) {
+    return `thought for ${minutes}m ${seconds}s`;
+  }
+  return `thought for ${seconds}s`;
+}
+
+function formatTimestamp(date = new Date(), durationMs = null) {
+  const base = formatClockTimestamp(date);
+  if (durationMs == null) {
+    return base;
+  }
+  return `${base} · ${formatDurationMs(durationMs)}`;
+}
+
+function cloneMessageCard(role, timestamp = new Date(), durationMs = null) {
   const fragment = messageTemplate.content.cloneNode(true);
   const card = fragment.querySelector('.message-card');
   card.dataset.role = role;
   card.classList.add(`role-${role}`);
   card.querySelector('.message-role').textContent = role === 'user' ? 'You' : 'Assistant';
-  card.querySelector('.message-time').textContent = new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+  card.querySelector('.message-time').textContent = formatTimestamp(timestamp, durationMs);
   return card;
 }
 
@@ -112,10 +139,18 @@ function wireCodeButtons(body) {
   }
 }
 
-function createMessageCard(role, content = '', rawForCopy = content, extraClass = '') {
-  const card = cloneMessageCard(role);
+function createMessageCard(
+  role,
+  content = '',
+  rawForCopy = content,
+  extraClass = '',
+  timestamp = new Date(),
+  durationMs = null
+) {
+  const card = cloneMessageCard(role, timestamp, durationMs);
   const body = card.querySelector('.message-body');
   const copyButton = card.querySelector('.copy-message');
+  const timeEl = card.querySelector('.message-time');
 
   if (extraClass) {
     card.classList.add(extraClass);
@@ -133,15 +168,19 @@ function createMessageCard(role, content = '', rawForCopy = content, extraClass 
     messagesEl.scrollTop = messagesEl.scrollHeight;
   };
 
+  const setTimestamp = (date = new Date(), durationMsValue = null) => {
+    timeEl.textContent = formatTimestamp(date, durationMsValue);
+  };
+
   update(content, rawForCopy);
   messagesEl.appendChild(card);
   messagesEl.scrollTop = messagesEl.scrollHeight;
 
-  return { card, update };
+  return { card, update, setTimestamp };
 }
 
-function appendMessage(role, content, rawForCopy = content) {
-  return createMessageCard(role, content, rawForCopy);
+function appendMessage(role, content, rawForCopy = content, timestamp = new Date(), durationMs = null) {
+  return createMessageCard(role, content, rawForCopy, '', timestamp, durationMs);
 }
 
 function setActivity(message) {
@@ -221,13 +260,29 @@ async function submitPrompt(event) {
   const text = promptEl.value.trim();
   if (!text) return;
 
-  appendMessage('user', text);
-  state.messages.push({ role: 'user', text });
+  const userTimestamp = new Date();
+  appendMessage('user', text, text, userTimestamp);
+  state.messages.push({
+    role: 'user',
+    text,
+    timestamp: userTimestamp.toISOString(),
+    durationMs: null,
+  });
+
   promptEl.value = '';
   sendButton.disabled = true;
   sendButton.textContent = 'Working…';
 
-  const pendingAssistant = createMessageCard('assistant', 'Thinking…', 'Thinking…', 'pending');
+  const assistantStartedAt = new Date();
+  const pendingAssistant = createMessageCard(
+    'assistant',
+    'Thinking…',
+    'Thinking…',
+    'pending',
+    assistantStartedAt,
+    null
+  );
+
   let phaseTimer = null;
 
   try {
@@ -248,15 +303,39 @@ async function submitPrompt(event) {
     if (phaseTimer) clearTimeout(phaseTimer);
 
     const assistantText = responseToDisplay(body) || 'No response text returned.';
+    const assistantCompletedAt = new Date();
+    const durationMs = assistantCompletedAt.getTime() - assistantStartedAt.getTime();
+
     setActivity('Generating response…');
     pendingAssistant.card.classList.remove('pending');
+    pendingAssistant.setTimestamp(assistantCompletedAt, durationMs);
     await animateAssistantText(pendingAssistant, assistantText, assistantText);
-    state.messages.push({ role: 'assistant', text: assistantText });
+
+    state.messages.push({
+      role: 'assistant',
+      text: assistantText,
+      timestamp: assistantCompletedAt.toISOString(),
+      durationMs,
+    });
+
     setActivity('');
   } catch (error) {
     if (phaseTimer) clearTimeout(phaseTimer);
+
+    const assistantCompletedAt = new Date();
+    const durationMs = assistantCompletedAt.getTime() - assistantStartedAt.getTime();
+
     pendingAssistant.card.classList.remove('pending');
+    pendingAssistant.setTimestamp(assistantCompletedAt, durationMs);
     pendingAssistant.update(`Request failed:\n\n${error.message}`);
+
+    state.messages.push({
+      role: 'assistant',
+      text: `Request failed:\n\n${error.message}`,
+      timestamp: assistantCompletedAt.toISOString(),
+      durationMs,
+    });
+
     setActivity('');
   } finally {
     sendButton.disabled = false;
@@ -266,6 +345,7 @@ async function submitPrompt(event) {
 }
 
 composer.addEventListener('submit', submitPrompt);
+
 promptEl.addEventListener('keydown', (event) => {
   if (event.key === 'Enter' && event.ctrlKey) {
     composer.requestSubmit();
@@ -296,15 +376,18 @@ insertTemplateButton.addEventListener('click', () => {
 
 wrapCodeCheckbox.addEventListener('change', () => {
   state.wrapCode = wrapCodeCheckbox.checked;
-  for (const message of messagesEl.querySelectorAll('.message-body')) {
-    const raw = message.textContent || '';
-    // Re-render using the corresponding stored source when possible by rebuilding from card copy buffer.
-  }
-  // Re-render from state so code blocks pick up the new wrapping mode.
+
   const saved = [...state.messages];
   messagesEl.innerHTML = '';
+
   for (const item of saved) {
-    appendMessage(item.role, item.text, item.text);
+    appendMessage(
+      item.role,
+      item.text,
+      item.text,
+      item.timestamp ? new Date(item.timestamp) : new Date(),
+      item.durationMs ?? null
+    );
   }
 });
 
