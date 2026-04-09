@@ -67,7 +67,6 @@ struct FeedbackRequest {
     helpful: bool,
     note: Option<String>,
     duration_ms: Option<i64>,
-    timestamp: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -331,10 +330,7 @@ fn store_feedback(
     let conn = Connection::open(db_path)?;
 
     let files_json = serde_json::to_string(&payload.files_reviewed.unwrap_or_default())?;
-    let repo_path_sha256 = payload
-        .repo_path
-        .as_deref()
-        .map(sha256_hex);
+    let repo_path_sha256 = payload.repo_path.as_deref().map(sha256_hex);
 
     conn.execute(
         r#"
@@ -376,11 +372,7 @@ fn store_feedback(
                 summary_text
             ) VALUES (?1, ?2, ?3)
             "#,
-            params![
-                analysis_run_id,
-                payload.repo_path,
-                payload.response,
-            ],
+            params![analysis_run_id, payload.repo_path, payload.response],
         )?;
     }
 
@@ -441,6 +433,31 @@ fn request_needs_repo_analysis(request: &MessageRequest) -> bool {
             "rust code",
             "files that you reviewed",
             "important modules",
+        ]
+        .iter()
+        .any(|term| lower.contains(term))
+}
+
+fn request_needs_file_fix(request: &MessageRequest) -> bool {
+    let Some(text) = latest_user_text(request) else {
+        return false;
+    };
+
+    let lower = text.to_ascii_lowercase();
+    let detected = detect_existing_path(&text);
+
+    let is_file = detected.as_deref().map(|p| p.is_file()).unwrap_or(false);
+
+    is_file
+        && [
+            "fix",
+            "full source code fix",
+            "rewrite",
+            "patch",
+            "update this file",
+            "modify this file",
+            "correct this file",
+            "repair this file",
         ]
         .iter()
         .any(|term| lower.contains(term))
@@ -526,7 +543,7 @@ fn build_repo_fallback_context_for_path(path: &Path) -> Result<String, std::io::
 fn build_single_file_fallback(path: &Path) -> Result<String, std::io::Error> {
     let lang = code_fence_lang(path);
     let content = fs::read_to_string(path)?;
-    let snippet = truncate_chars(&content, MAX_FALLBACK_FILE_CHARS);
+    let snippet = truncate_chars(&content, MAX_FALLBACK_TOTAL_CHARS.min(MAX_FALLBACK_FILE_CHARS));
 
     Ok(format!(
         "Requested file: {}\n\n```{}\n{}\n```\n",
@@ -534,6 +551,45 @@ fn build_single_file_fallback(path: &Path) -> Result<String, std::io::Error> {
         lang,
         snippet
     ))
+}
+
+fn build_file_fix_fallback_request(
+    request: &MessageRequest,
+    file_path: &Path,
+) -> Result<MessageRequest, std::io::Error> {
+    let mut req = request.clone();
+    req.stream = false;
+    req.tools = None;
+    req.tool_choice = None;
+
+    let content = fs::read_to_string(file_path)?;
+    let snippet = truncate_chars(&content, MAX_FALLBACK_TOTAL_CHARS);
+    let lang = code_fence_lang(file_path);
+
+    let synthesis = format!(
+        "You are being given the full target file directly because structured tool calls were unreliable.\n\
+The user wants a concrete source-level fix.\n\
+Read the file content below and respond with:\n\
+1. a short diagnosis of the problem\n\
+2. the full corrected file\n\
+3. a short explanation of the key changes\n\n\
+TARGET FILE: {}\n\
+====================\n\
+```{}\n{}\n```\n",
+        file_path.display(),
+        lang,
+        snippet
+    );
+
+    match &mut req.system {
+        Some(system) => {
+            system.push_str("\n\n");
+            system.push_str(&synthesis);
+        }
+        None => req.system = Some(synthesis),
+    }
+
+    Ok(req)
 }
 
 fn code_fence_lang(path: &Path) -> &'static str {
@@ -623,11 +679,22 @@ async fn process_message_request(
     let mut runner_request = maybe_enrich_request_with_local_sources(request);
     let require_tool_use = request_has_local_path(request);
     let wants_repo_analysis = request_needs_repo_analysis(request);
+    let wants_file_fix = request_needs_file_fix(request);
+    let detected_path = latest_user_text(request).and_then(|text| detect_existing_path(&text));
     let mut saw_real_tool_use = false;
+
+    if wants_file_fix {
+        if let Some(path) = detected_path.as_deref() {
+            if path.is_file() {
+                let fallback_request = build_file_fix_fallback_request(request, path)?;
+                return call_runner(state, &fallback_request).await;
+            }
+        }
+    }
 
     runner_request.stream = false;
 
-    if should_enable_tools(request) && !wants_repo_analysis {
+    if should_enable_tools(request) && !wants_repo_analysis && !wants_file_fix {
         let tool_specs = filtered_tool_specs(&state.tool_registry);
         if !tool_specs.is_empty() {
             runner_request.tools = Some(tool_specs);
@@ -645,6 +712,15 @@ async fn process_message_request(
             let fake_plan = looks_like_fake_tool_plan(&response);
 
             if require_tool_use && !saw_real_tool_use {
+                if wants_file_fix {
+                    if let Some(path) = detected_path.as_deref() {
+                        if path.is_file() {
+                            let fallback_request = build_file_fix_fallback_request(request, path)?;
+                            return call_runner(state, &fallback_request).await;
+                        }
+                    }
+                }
+
                 if wants_repo_analysis {
                     if let Some(fallback_context) = build_repo_fallback_context(request) {
                         if !fallback_context.trim().is_empty() {
@@ -797,19 +873,13 @@ fn output_blocks_to_input_message(blocks: &[OutputContentBlock]) -> Option<Input
     let content = blocks
         .iter()
         .filter_map(|block| match block {
-            OutputContentBlock::Text { text } => {
-                Some(InputContentBlock::Text { text: text.clone() })
-            }
-            OutputContentBlock::ToolUse { id, name, input } => {
-                Some(InputContentBlock::ToolUse {
-                    id: id.clone(),
-                    name: name.clone(),
-                    input: input.clone(),
-                })
-            }
-            OutputContentBlock::Thinking { .. } | OutputContentBlock::RedactedThinking { .. } => {
-                None
-            }
+            OutputContentBlock::Text { text } => Some(InputContentBlock::Text { text: text.clone() }),
+            OutputContentBlock::ToolUse { id, name, input } => Some(InputContentBlock::ToolUse {
+                id: id.clone(),
+                name: name.clone(),
+                input: input.clone(),
+            }),
+            OutputContentBlock::Thinking { .. } | OutputContentBlock::RedactedThinking { .. } => None,
         })
         .collect::<Vec<_>>();
 
