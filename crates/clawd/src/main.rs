@@ -17,8 +17,10 @@ use axum::{
 };
 use plugins::{HookRunner, PluginManager, PluginManagerConfig};
 use reqwest::Client;
+use rusqlite::{params, Connection};
 use runtime::{ConfigLoader, RuntimeConfig};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tools::GlobalToolRegistry;
 use tracing::{error, info};
 
@@ -26,6 +28,7 @@ const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_PORT: u16 = 8080;
 const DEFAULT_RUNNER_BASE_URL: &str = "http://127.0.0.1:8081";
 const DEFAULT_RUNNER_MESSAGES_PATH: &str = "/v1/messages";
+const DEFAULT_DB_PATH: &str = "data/knowledge.db";
 
 const MAX_FALLBACK_FILES: usize = 5;
 const MAX_FALLBACK_FILE_CHARS: usize = 2500;
@@ -40,17 +43,37 @@ struct AppState {
     runner_messages_url: String,
     tool_registry: GlobalToolRegistry,
     hook_runner: HookRunner,
+    db_path: PathBuf,
 }
 
 #[derive(Debug, Serialize)]
 struct HealthResponse {
     status: &'static str,
     runner_messages_url: String,
+    db_path: String,
 }
 
 #[derive(Debug, Serialize)]
 struct ErrorResponse {
     error: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct FeedbackRequest {
+    prompt: String,
+    response: String,
+    repo_path: Option<String>,
+    files_reviewed: Option<Vec<String>>,
+    helpful: bool,
+    note: Option<String>,
+    duration_ms: Option<i64>,
+    timestamp: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct FeedbackResponse {
+    status: &'static str,
+    analysis_run_id: i64,
 }
 
 #[tokio::main]
@@ -81,6 +104,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ensure_leading_slash(&runner_messages_path)
     );
 
+    let db_path = resolve_db_path();
+    ensure_feedback_schema(&db_path)?;
+
     let http = Client::builder()
         .connect_timeout(Duration::from_secs(30))
         .build()?;
@@ -93,6 +119,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         runner_messages_url: runner_messages_url.clone(),
         tool_registry,
         hook_runner,
+        db_path,
     };
 
     let app = Router::new()
@@ -101,6 +128,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/static/styles.css", get(static_styles_css))
         .route("/health", get(health))
         .route("/v1/messages", post(messages))
+        .route("/feedback", post(feedback))
         .with_state(state);
 
     let addr: SocketAddr = format!("{host}:{port}").parse()?;
@@ -110,6 +138,110 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
+
+    Ok(())
+}
+
+fn resolve_db_path() -> PathBuf {
+    if let Ok(value) = env::var("CLAWD_DB_PATH") {
+        return PathBuf::from(value);
+    }
+    PathBuf::from(DEFAULT_DB_PATH)
+}
+
+fn ensure_feedback_schema(db_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(parent) = db_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let conn = Connection::open(db_path)?;
+
+    conn.execute_batch(
+        r#"
+        PRAGMA journal_mode=WAL;
+        PRAGMA synchronous=NORMAL;
+        PRAGMA foreign_keys=ON;
+
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS documents (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            path TEXT NOT NULL UNIQUE,
+            kind TEXT NOT NULL,
+            sha256 TEXT NOT NULL,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS chunks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            document_id INTEGER NOT NULL,
+            chunk_index INTEGER NOT NULL,
+            text TEXT NOT NULL,
+            FOREIGN KEY(document_id) REFERENCES documents(id) ON DELETE CASCADE,
+            UNIQUE(document_id, chunk_index)
+        );
+
+        CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+            text,
+            content='chunks',
+            content_rowid='id'
+        );
+
+        CREATE TABLE IF NOT EXISTS sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_key TEXT NOT NULL UNIQUE,
+            summary TEXT,
+            transcript_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS tool_results (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tool_name TEXT NOT NULL,
+            input_json TEXT NOT NULL,
+            output_json TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS analysis_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_key TEXT,
+            prompt_text TEXT NOT NULL,
+            response_text TEXT NOT NULL,
+            repo_path TEXT,
+            repo_path_sha256 TEXT,
+            files_reviewed_json TEXT NOT NULL DEFAULT '[]',
+            helpful INTEGER,
+            feedback_note TEXT,
+            duration_ms INTEGER,
+            source_mode TEXT NOT NULL DEFAULT 'filesystem',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_analysis_runs_repo_path
+        ON analysis_runs(repo_path);
+
+        CREATE INDEX IF NOT EXISTS idx_analysis_runs_helpful
+        ON analysis_runs(helpful);
+
+        CREATE TABLE IF NOT EXISTS approved_summaries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            analysis_run_id INTEGER NOT NULL UNIQUE,
+            repo_path TEXT,
+            summary_text TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(analysis_run_id) REFERENCES analysis_runs(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_approved_summaries_repo_path
+        ON approved_summaries(repo_path);
+
+        INSERT OR IGNORE INTO settings(key, value) VALUES ('schema_version', '2');
+        "#,
+    )?;
 
     Ok(())
 }
@@ -163,9 +295,109 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
         StatusCode::OK,
         Json(HealthResponse {
             status: "ok",
-            runner_messages_url: state.runner_messages_url,
+            runner_messages_url: state.runner_messages_url.clone(),
+            db_path: state.db_path.display().to_string(),
         }),
     )
+}
+
+async fn feedback(
+    State(state): State<AppState>,
+    Json(payload): Json<FeedbackRequest>,
+) -> impl IntoResponse {
+    match store_feedback(&state.db_path, payload) {
+        Ok(analysis_run_id) => (
+            StatusCode::OK,
+            Json(FeedbackResponse {
+                status: "ok",
+                analysis_run_id,
+            }),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::BAD_GATEWAY,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+fn store_feedback(
+    db_path: &Path,
+    payload: FeedbackRequest,
+) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
+    let conn = Connection::open(db_path)?;
+
+    let files_json = serde_json::to_string(&payload.files_reviewed.unwrap_or_default())?;
+    let repo_path_sha256 = payload
+        .repo_path
+        .as_deref()
+        .map(sha256_hex);
+
+    conn.execute(
+        r#"
+        INSERT INTO analysis_runs (
+            session_key,
+            prompt_text,
+            response_text,
+            repo_path,
+            repo_path_sha256,
+            files_reviewed_json,
+            helpful,
+            feedback_note,
+            duration_ms,
+            source_mode
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+        "#,
+        params![
+            Option::<String>::None,
+            payload.prompt,
+            payload.response,
+            payload.repo_path,
+            repo_path_sha256,
+            files_json,
+            if payload.helpful { 1 } else { 0 },
+            payload.note.unwrap_or_default(),
+            payload.duration_ms,
+            "filesystem",
+        ],
+    )?;
+
+    let analysis_run_id = conn.last_insert_rowid();
+
+    if payload.helpful {
+        conn.execute(
+            r#"
+            INSERT INTO approved_summaries (
+                analysis_run_id,
+                repo_path,
+                summary_text
+            ) VALUES (?1, ?2, ?3)
+            "#,
+            params![
+                analysis_run_id,
+                payload.repo_path,
+                payload.response,
+            ],
+        )?;
+    }
+
+    Ok(analysis_run_id)
+}
+
+fn sha256_hex(value: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(value.as_bytes());
+    let digest = hasher.finalize();
+
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{:02x}", byte);
+    }
+    out
 }
 
 async fn messages(
@@ -359,12 +591,15 @@ fn build_fallback_synthesis_request(
 
     let synthesis = format!(
         "You are being given a bounded local repository snapshot for analysis.\n\
+Prioritize the ROOT project at the repository root unless the user explicitly asked for a nested subproject.\n\
+Treat nested crates or subprojects as secondary unless they are required to explain the root project's behavior.\n\
 Analyze the Rust codebase based only on the provided files.\n\
 Give:\n\
-1. the important modules\n\
-2. likely entry points\n\
-3. control flow between major files/modules\n\
-4. the files reviewed and each file's role\n\n\
+1. the important modules in the root project\n\
+2. the likely root entry points\n\
+3. control flow between major root files/modules\n\
+4. any important nested subprojects only if they materially affect the root project\n\
+5. the files reviewed and each file's role\n\n\
 REPOSITORY SNAPSHOT\n\
 ===================\n\
 {fallback_context}"
