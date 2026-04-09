@@ -139,13 +139,119 @@ function wireCodeButtons(body) {
   }
 }
 
+function buildFeedbackBar(message) {
+  if (
+    message.role !== 'assistant' ||
+    message.feedbackSubmitted ||
+    message.responseComplete !== true ||
+    message.isError === true
+  ) {
+    return '';
+  }
+
+  return `
+    <div class="feedback-bar">
+      <span class="feedback-label">Was this helpful?</span>
+      <button type="button" class="feedback-btn" data-feedback="up">👍</button>
+      <button type="button" class="feedback-btn" data-feedback="down">👎</button>
+      <button type="button" class="feedback-note-btn">Add note</button>
+    </div>
+    <div class="feedback-note hidden">
+      <textarea class="feedback-note-input" rows="3" placeholder="Optional note about what was right or wrong"></textarea>
+      <div class="feedback-note-actions">
+        <button type="button" class="feedback-submit-note secondary small">Submit feedback</button>
+      </div>
+    </div>
+  `;
+}
+
+async function submitFeedback(message, helpful, note = '') {
+  const payload = {
+    prompt: message.promptText ?? '',
+    response: message.text ?? '',
+    repo_path: message.repoPath ?? null,
+    files_reviewed: message.filesReviewed ?? [],
+    helpful,
+    note: note.trim(),
+    duration_ms: message.durationMs ?? null,
+  };
+
+  const response = await fetch('/feedback', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(body.error || `HTTP ${response.status}`);
+  }
+}
+
+function wireFeedback(card, message) {
+  const bar = card.querySelector('.feedback-bar');
+  if (!bar) return;
+
+  const noteWrap = card.querySelector('.feedback-note');
+  const noteInput = card.querySelector('.feedback-note-input');
+  const noteSubmit = card.querySelector('.feedback-submit-note');
+  const upBtn = card.querySelector('[data-feedback="up"]');
+  const downBtn = card.querySelector('[data-feedback="down"]');
+  const noteBtn = card.querySelector('.feedback-note-btn');
+
+  const markSubmitted = (label) => {
+    bar.innerHTML = `<span class="feedback-saved">${label}</span>`;
+    if (noteWrap) {
+      noteWrap.classList.add('hidden');
+    }
+    message.feedbackSubmitted = true;
+  };
+
+  upBtn?.addEventListener('click', async () => {
+    upBtn.disabled = true;
+    if (downBtn) downBtn.disabled = true;
+    try {
+      await submitFeedback(message, true, '');
+      markSubmitted('Saved feedback: helpful');
+    } catch (error) {
+      upBtn.disabled = false;
+      if (downBtn) downBtn.disabled = false;
+      alert(`Feedback failed: ${error.message}`);
+    }
+  });
+
+  downBtn?.addEventListener('click', () => {
+    if (noteWrap) {
+      noteWrap.classList.remove('hidden');
+    }
+  });
+
+  noteBtn?.addEventListener('click', () => {
+    if (noteWrap) {
+      noteWrap.classList.toggle('hidden');
+    }
+  });
+
+  noteSubmit?.addEventListener('click', async () => {
+    noteSubmit.disabled = true;
+    try {
+      await submitFeedback(message, false, noteInput?.value || '');
+      markSubmitted('Saved feedback: not helpful');
+    } catch (error) {
+      noteSubmit.disabled = false;
+      alert(`Feedback failed: ${error.message}`);
+    }
+  });
+}
+
 function createMessageCard(
   role,
   content = '',
   rawForCopy = content,
   extraClass = '',
   timestamp = new Date(),
-  durationMs = null
+  durationMs = null,
+  messageMeta = null
 ) {
   const card = cloneMessageCard(role, timestamp, durationMs);
   const body = card.querySelector('.message-body');
@@ -157,8 +263,12 @@ function createMessageCard(
   }
 
   const update = (nextContent, nextRaw = nextContent) => {
-    body.innerHTML = renderMarkdownish(nextContent);
+    const feedbackHtml = messageMeta ? buildFeedbackBar(messageMeta) : '';
+    body.innerHTML = `${renderMarkdownish(nextContent)}${feedbackHtml}`;
     wireCodeButtons(body);
+    if (messageMeta) {
+      wireFeedback(card, messageMeta);
+    }
     copyButton.onclick = async () => {
       await navigator.clipboard.writeText(String(nextRaw ?? ''));
       const original = copyButton.textContent;
@@ -179,8 +289,15 @@ function createMessageCard(
   return { card, update, setTimestamp };
 }
 
-function appendMessage(role, content, rawForCopy = content, timestamp = new Date(), durationMs = null) {
-  return createMessageCard(role, content, rawForCopy, '', timestamp, durationMs);
+function appendMessage(
+  role,
+  content,
+  rawForCopy = content,
+  timestamp = new Date(),
+  durationMs = null,
+  messageMeta = null
+) {
+  return createMessageCard(role, content, rawForCopy, '', timestamp, durationMs, messageMeta);
 }
 
 function setActivity(message) {
@@ -208,6 +325,16 @@ async function animateAssistantText(messageView, finalText, rawForCopy) {
 function summarizeToolUse(block) {
   const pretty = JSON.stringify(block.input ?? {}, null, 2);
   return `Used tool: ${block.name}\n\n\`\`\`json\n${pretty}\n\`\`\``;
+}
+
+function extractReviewedFiles(text) {
+  const matches = [...String(text ?? '').matchAll(/FILE:\s+([^\n]+)/g)];
+  return matches.map((m) => m[1].trim());
+}
+
+function detectRepoPathFromPrompt(text) {
+  const match = String(text ?? '').match(/([A-Za-z]:\\[^\n]+|\/[^\n]+)/);
+  return match ? match[1].trim() : null;
 }
 
 function responseToDisplay(response) {
@@ -261,26 +388,42 @@ async function submitPrompt(event) {
   if (!text) return;
 
   const userTimestamp = new Date();
-  appendMessage('user', text, text, userTimestamp);
-  state.messages.push({
+  const userMessage = {
     role: 'user',
     text,
     timestamp: userTimestamp.toISOString(),
     durationMs: null,
-  });
+  };
+
+  appendMessage('user', text, text, userTimestamp, null, userMessage);
+  state.messages.push(userMessage);
 
   promptEl.value = '';
   sendButton.disabled = true;
   sendButton.textContent = 'Working…';
 
   const assistantStartedAt = new Date();
+  const assistantMessage = {
+    role: 'assistant',
+    text: 'Thinking…',
+    timestamp: assistantStartedAt.toISOString(),
+    durationMs: null,
+    promptText: text,
+    repoPath: detectRepoPathFromPrompt(text),
+    filesReviewed: [],
+    feedbackSubmitted: false,
+    responseComplete: false,
+    isError: false,
+  };
+
   const pendingAssistant = createMessageCard(
     'assistant',
     'Thinking…',
     'Thinking…',
     'pending',
     assistantStartedAt,
-    null
+    null,
+    assistantMessage
   );
 
   let phaseTimer = null;
@@ -306,36 +449,38 @@ async function submitPrompt(event) {
     const assistantCompletedAt = new Date();
     const durationMs = assistantCompletedAt.getTime() - assistantStartedAt.getTime();
 
+    assistantMessage.text = assistantText;
+    assistantMessage.timestamp = assistantCompletedAt.toISOString();
+    assistantMessage.durationMs = durationMs;
+    assistantMessage.filesReviewed = extractReviewedFiles(assistantText);
+    assistantMessage.responseComplete = true;
+    assistantMessage.isError = false;
+
     setActivity('Generating response…');
     pendingAssistant.card.classList.remove('pending');
     pendingAssistant.setTimestamp(assistantCompletedAt, durationMs);
     await animateAssistantText(pendingAssistant, assistantText, assistantText);
 
-    state.messages.push({
-      role: 'assistant',
-      text: assistantText,
-      timestamp: assistantCompletedAt.toISOString(),
-      durationMs,
-    });
-
+    state.messages.push(assistantMessage);
     setActivity('');
   } catch (error) {
     if (phaseTimer) clearTimeout(phaseTimer);
 
     const assistantCompletedAt = new Date();
     const durationMs = assistantCompletedAt.getTime() - assistantStartedAt.getTime();
+    const failureText = `Request failed:\n\n${error.message}`;
+
+    assistantMessage.text = failureText;
+    assistantMessage.timestamp = assistantCompletedAt.toISOString();
+    assistantMessage.durationMs = durationMs;
+    assistantMessage.responseComplete = false;
+    assistantMessage.isError = true;
 
     pendingAssistant.card.classList.remove('pending');
     pendingAssistant.setTimestamp(assistantCompletedAt, durationMs);
-    pendingAssistant.update(`Request failed:\n\n${error.message}`);
+    pendingAssistant.update(failureText, failureText);
 
-    state.messages.push({
-      role: 'assistant',
-      text: `Request failed:\n\n${error.message}`,
-      timestamp: assistantCompletedAt.toISOString(),
-      durationMs,
-    });
-
+    state.messages.push(assistantMessage);
     setActivity('');
   } finally {
     sendButton.disabled = false;
@@ -386,7 +531,8 @@ wrapCodeCheckbox.addEventListener('change', () => {
       item.text,
       item.text,
       item.timestamp ? new Date(item.timestamp) : new Date(),
-      item.durationMs ?? null
+      item.durationMs ?? null,
+      item
     );
   }
 });
