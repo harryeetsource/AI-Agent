@@ -37,6 +37,10 @@ const MAX_TOOL_ROUNDS: usize = 1;
 const MAX_SUMMARY_FILES: usize = 12;
 const MAX_TOOL_OUTPUT_CHARS: usize = 4000;
 
+const FILE_REWRITE_MAX_TOKENS: u32 = 20_000;
+const FILE_REWRITE_CONTINUATION_MAX_TOKENS: u32 = 8_000;
+const MAX_FILE_REWRITE_CONTINUATIONS: usize = 3;
+
 #[derive(Clone)]
 struct AppState {
     http: Client,
@@ -73,6 +77,12 @@ struct FeedbackRequest {
 struct FeedbackResponse {
     status: &'static str,
     analysis_run_id: i64,
+}
+
+enum RewriteAssessment {
+    Complete,
+    Incomplete { partial_code: String },
+    Malformed(String),
 }
 
 #[tokio::main]
@@ -417,8 +427,10 @@ fn request_needs_repo_analysis(request: &MessageRequest) -> bool {
     };
 
     let lower = text.to_ascii_lowercase();
+    let detected = detect_existing_path(&text);
+    let is_dir = detected.as_deref().map(|p| p.is_dir()).unwrap_or(false);
 
-    detect_existing_path(&text).is_some()
+    is_dir
         && [
             "analyze",
             "analysis",
@@ -445,7 +457,6 @@ fn request_needs_file_fix(request: &MessageRequest) -> bool {
 
     let lower = text.to_ascii_lowercase();
     let detected = detect_existing_path(&text);
-
     let is_file = detected.as_deref().map(|p| p.is_file()).unwrap_or(false);
 
     is_file
@@ -458,6 +469,18 @@ fn request_needs_file_fix(request: &MessageRequest) -> bool {
             "modify this file",
             "correct this file",
             "repair this file",
+            "provide a version of this file",
+            "provide a version",
+            "full rewrite",
+            "full file rewrite",
+            "full replacement",
+            "complete file",
+            "complete replacement",
+            "return the full file",
+            "provide the full file",
+            "rewrite this file",
+            "replacement file",
+            "version of this file",
         ]
         .iter()
         .any(|term| lower.contains(term))
@@ -543,7 +566,7 @@ fn build_repo_fallback_context_for_path(path: &Path) -> Result<String, std::io::
 fn build_single_file_fallback(path: &Path) -> Result<String, std::io::Error> {
     let lang = code_fence_lang(path);
     let content = fs::read_to_string(path)?;
-    let snippet = truncate_chars(&content, MAX_FALLBACK_TOTAL_CHARS.min(MAX_FALLBACK_FILE_CHARS));
+    let snippet = truncate_chars(&content, MAX_FALLBACK_FILE_CHARS);
 
     Ok(format!(
         "Requested file: {}\n\n```{}\n{}\n```\n",
@@ -561,24 +584,27 @@ fn build_file_fix_fallback_request(
     req.stream = false;
     req.tools = None;
     req.tool_choice = None;
+    req.max_tokens = FILE_REWRITE_MAX_TOKENS;
 
     let content = fs::read_to_string(file_path)?;
-    let snippet = truncate_chars(&content, MAX_FALLBACK_TOTAL_CHARS);
     let lang = code_fence_lang(file_path);
 
     let synthesis = format!(
-        "You are being given the full target file directly because structured tool calls were unreliable.\n\
-The user wants a concrete source-level fix.\n\
-Read the file content below and respond with:\n\
-1. a short diagnosis of the problem\n\
-2. the full corrected file\n\
-3. a short explanation of the key changes\n\n\
+        "You are rewriting a single source file.\n\
+Return EXACTLY ONE fenced {} code block containing the COMPLETE replacement file.\n\
+Do not include any prose before or after the code block.\n\
+Do not include diagnosis.\n\
+Do not include explanation.\n\
+Do not shorten the file.\n\
+Do not omit sections.\n\
+Preserve the original file's structure, formatting style, comment density, helper layout, and function ordering unless a change is absolutely necessary.\n\
+If you cannot complete the full file in one response, return a single fenced code block containing the longest correct continuation you can produce.\n\n\
 TARGET FILE: {}\n\
-====================\n\
-```{}\n{}\n```\n",
+```{}\n{}\n```",
+        lang,
         file_path.display(),
         lang,
-        snippet
+        content
     );
 
     match &mut req.system {
@@ -590,6 +616,54 @@ TARGET FILE: {}\n\
     }
 
     Ok(req)
+}
+
+fn build_file_rewrite_continuation_request(
+    request: &MessageRequest,
+    file_path: &Path,
+    lang: &str,
+    source: &str,
+    current_partial: &str,
+) -> MessageRequest {
+    let mut req = request.clone();
+    req.stream = false;
+    req.tools = None;
+    req.tool_choice = None;
+    req.max_tokens = FILE_REWRITE_CONTINUATION_MAX_TOKENS;
+
+    let tail = last_n_lines(current_partial, 80);
+
+    let synthesis = format!(
+        "You are continuing a partially generated rewrite of a single source file.\n\
+Return EXACTLY ONE fenced {} code block containing ONLY the NEXT continuation chunk.\n\
+Do not restart from the beginning.\n\
+Do not repeat large earlier sections.\n\
+Continue directly after the existing partial output.\n\
+Do not include prose.\n\
+Do not include explanation.\n\
+If the file is already complete, return EXACTLY the single word DONE.\n\n\
+TARGET FILE PATH: {}\n\n\
+ORIGINAL SOURCE:\n\
+```{}\n{}\n```\n\n\
+CURRENT PARTIAL OUTPUT TAIL:\n\
+```{}\n{}\n```",
+        lang,
+        file_path.display(),
+        lang,
+        source,
+        lang,
+        tail
+    );
+
+    match &mut req.system {
+        Some(system) => {
+            system.push_str("\n\n");
+            system.push_str(&synthesis);
+        }
+        None => req.system = Some(synthesis),
+    }
+
+    req
 }
 
 fn code_fence_lang(path: &Path) -> &'static str {
@@ -686,8 +760,7 @@ async fn process_message_request(
     if wants_file_fix {
         if let Some(path) = detected_path.as_deref() {
             if path.is_file() {
-                let fallback_request = build_file_fix_fallback_request(request, path)?;
-                return call_runner(state, &fallback_request).await;
+                return run_single_file_rewrite(state, request, path).await;
             }
         }
     }
@@ -712,15 +785,6 @@ async fn process_message_request(
             let fake_plan = looks_like_fake_tool_plan(&response);
 
             if require_tool_use && !saw_real_tool_use {
-                if wants_file_fix {
-                    if let Some(path) = detected_path.as_deref() {
-                        if path.is_file() {
-                            let fallback_request = build_file_fix_fallback_request(request, path)?;
-                            return call_runner(state, &fallback_request).await;
-                        }
-                    }
-                }
-
                 if wants_repo_analysis {
                     if let Some(fallback_context) = build_repo_fallback_context(request) {
                         if !fallback_context.trim().is_empty() {
@@ -811,6 +875,204 @@ async fn process_message_request(
     .into())
 }
 
+async fn run_single_file_rewrite(
+    state: &AppState,
+    request: &MessageRequest,
+    file_path: &Path,
+) -> Result<MessageResponse, Box<dyn std::error::Error + Send + Sync>> {
+    let source = fs::read_to_string(file_path)?;
+    let initial_request = build_file_fix_fallback_request(request, file_path)?;
+    let initial_response = call_runner(state, &initial_request).await?;
+
+    match assess_single_file_rewrite_response(&initial_response, &source) {
+        RewriteAssessment::Complete => Ok(initial_response),
+        RewriteAssessment::Incomplete { partial_code } => {
+            continue_file_rewrite(state, request, file_path, &source, &partial_code).await
+        }
+        RewriteAssessment::Malformed(reason) => Err(std::io::Error::other(reason).into()),
+    }
+}
+
+fn assess_single_file_rewrite_response(
+    response: &MessageResponse,
+    source: &str,
+) -> RewriteAssessment {
+    let text = collect_text_blocks(response).trim().to_string();
+
+    if text == "DONE" {
+        return RewriteAssessment::Malformed(
+            "rewrite returned DONE before a complete file was assembled".to_string(),
+        );
+    }
+
+    let Some(code) = extract_single_fenced_code_block(&text) else {
+        return RewriteAssessment::Malformed(
+            "rewrite response was not exactly one fenced code block".to_string(),
+        );
+    };
+
+    if looks_rewrite_complete(&code, source) {
+        RewriteAssessment::Complete
+    } else {
+        RewriteAssessment::Incomplete { partial_code: code }
+    }
+}
+
+async fn continue_file_rewrite(
+    state: &AppState,
+    request: &MessageRequest,
+    file_path: &Path,
+    source: &str,
+    initial_partial: &str,
+) -> Result<MessageResponse, Box<dyn std::error::Error + Send + Sync>> {
+    let lang = code_fence_lang(file_path);
+    let mut assembled = initial_partial.to_string();
+
+    for _ in 0..MAX_FILE_REWRITE_CONTINUATIONS {
+        let continuation_request =
+            build_file_rewrite_continuation_request(request, file_path, lang, source, &assembled);
+
+        let response = call_runner(state, &continuation_request).await?;
+        let text = collect_text_blocks(&response).trim().to_string();
+
+        if text == "DONE" {
+            if looks_rewrite_complete(&assembled, source) {
+                return Ok(replace_response_content(response, lang, &assembled));
+            }
+
+            return Err(std::io::Error::other(
+                "model ended continuation before the full file was complete",
+            )
+            .into());
+        }
+
+        let Some(next_chunk) = extract_single_fenced_code_block(&text) else {
+            return Err(std::io::Error::other(
+                "continuation response was not exactly one fenced code block",
+            )
+            .into());
+        };
+
+        if next_chunk.trim().is_empty() {
+            return Err(std::io::Error::other(
+                "continuation response did not provide additional code",
+            )
+            .into());
+        }
+
+        let stitched = stitch_code_continuation(&assembled, &next_chunk);
+        if stitched == assembled {
+            return Err(std::io::Error::other(
+                "continuation response did not extend the existing partial file",
+            )
+            .into());
+        }
+
+        assembled = stitched;
+
+        if looks_rewrite_complete(&assembled, source) {
+            return Ok(replace_response_content(response, lang, &assembled));
+        }
+    }
+
+    Err(std::io::Error::other(
+        "full-file rewrite remained incomplete after bounded continuation attempts",
+    )
+    .into())
+}
+fn replace_response_content(
+    mut response: MessageResponse,
+    lang: &str,
+    code: &str,
+) -> MessageResponse {
+    response.content = vec![OutputContentBlock::Text {
+        text: format!("```{lang}\n{code}\n```"),
+    }];
+    response
+}
+fn looks_rewrite_complete(code: &str, source: &str) -> bool {
+    let src_lines = source.lines().count();
+    let out_lines = code.lines().count();
+    let src_chars = source.chars().count();
+    let out_chars = code.chars().count();
+
+    let lines_ok = out_lines.saturating_mul(100) >= src_lines.saturating_mul(60);
+    let chars_ok = out_chars.saturating_mul(100) >= src_chars.saturating_mul(50);
+
+    lines_ok && chars_ok
+}
+
+fn collect_text_blocks(response: &MessageResponse) -> String {
+    response
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            OutputContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn extract_single_fenced_code_block(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+
+    if !trimmed.starts_with("```") || !trimmed.ends_with("```") {
+        return None;
+    }
+
+    let first_newline = trimmed.find('\n')?;
+    let closing = trimmed.rfind("```")?;
+
+    if closing <= first_newline {
+        return None;
+    }
+
+    let inner = &trimmed[first_newline + 1..closing];
+    if inner.contains("```") {
+        return None;
+    }
+
+    Some(inner.trim_end_matches('\n').to_string())
+}
+
+fn stitch_code_continuation(existing: &str, next_chunk: &str) -> String {
+    if existing.trim().is_empty() {
+        return next_chunk.to_string();
+    }
+
+    let existing_lines: Vec<&str> = existing.lines().collect();
+    let next_lines: Vec<&str> = next_chunk.lines().collect();
+
+    let max_overlap = existing_lines.len().min(next_lines.len()).min(80);
+
+    for overlap in (1..=max_overlap).rev() {
+        if existing_lines[existing_lines.len() - overlap..] == next_lines[..overlap] {
+            let mut out = existing.to_string();
+            if !out.ends_with('\n') {
+                out.push('\n');
+            }
+            if overlap < next_lines.len() {
+                out.push_str(&next_lines[overlap..].join("\n"));
+            }
+            return out;
+        }
+    }
+
+    let mut out = existing.to_string();
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(next_chunk);
+    out
+}
+
+fn last_n_lines(text: &str, n: usize) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.len().saturating_sub(n);
+    lines[start..].join("\n")
+}
+
 async fn call_runner(
     state: &AppState,
     request: &MessageRequest,
@@ -873,13 +1135,19 @@ fn output_blocks_to_input_message(blocks: &[OutputContentBlock]) -> Option<Input
     let content = blocks
         .iter()
         .filter_map(|block| match block {
-            OutputContentBlock::Text { text } => Some(InputContentBlock::Text { text: text.clone() }),
-            OutputContentBlock::ToolUse { id, name, input } => Some(InputContentBlock::ToolUse {
-                id: id.clone(),
-                name: name.clone(),
-                input: input.clone(),
-            }),
-            OutputContentBlock::Thinking { .. } | OutputContentBlock::RedactedThinking { .. } => None,
+            OutputContentBlock::Text { text } => {
+                Some(InputContentBlock::Text { text: text.clone() })
+            }
+            OutputContentBlock::ToolUse { id, name, input } => {
+                Some(InputContentBlock::ToolUse {
+                    id: id.clone(),
+                    name: name.clone(),
+                    input: input.clone(),
+                })
+            }
+            OutputContentBlock::Thinking { .. } | OutputContentBlock::RedactedThinking { .. } => {
+                None
+            }
         })
         .collect::<Vec<_>>();
 
