@@ -152,14 +152,15 @@ function buildFeedbackBar(message) {
   return `
     <div class="feedback-bar">
       <span class="feedback-label">Was this helpful?</span>
-      <button type="button" class="feedback-btn" data-feedback="up">👍</button>
-      <button type="button" class="feedback-btn" data-feedback="down">👎</button>
-      <button type="button" class="feedback-note-btn">Add note</button>
+      <button type="button" class="feedback-btn" data-feedback="up" title="Helpful">👍</button>
+      <button type="button" class="feedback-btn" data-feedback="down" title="Not helpful">👎</button>
     </div>
     <div class="feedback-note hidden">
-      <textarea class="feedback-note-input" rows="3" placeholder="Optional note about what was right or wrong"></textarea>
+      <textarea class="feedback-note-input" rows="3" placeholder="What was wrong or missing?"></textarea>
       <div class="feedback-note-actions">
-        <button type="button" class="feedback-submit-note secondary small">Submit feedback</button>
+        <button type="button" class="feedback-send-note secondary small">Send</button>
+        <button type="button" class="feedback-skip-note secondary small">Skip note</button>
+        <button type="button" class="feedback-cancel-note secondary small">Cancel</button>
       </div>
     </div>
   `;
@@ -194,13 +195,25 @@ function wireFeedback(card, message) {
 
   const noteWrap = card.querySelector('.feedback-note');
   const noteInput = card.querySelector('.feedback-note-input');
-  const noteSubmit = card.querySelector('.feedback-submit-note');
   const upBtn = card.querySelector('[data-feedback="up"]');
   const downBtn = card.querySelector('[data-feedback="down"]');
-  const noteBtn = card.querySelector('.feedback-note-btn');
+  const sendNoteBtn = card.querySelector('.feedback-send-note');
+  const skipNoteBtn = card.querySelector('.feedback-skip-note');
+  const cancelNoteBtn = card.querySelector('.feedback-cancel-note');
+
+  const setButtonsDisabled = (disabled) => {
+    if (upBtn) upBtn.disabled = disabled;
+    if (downBtn) downBtn.disabled = disabled;
+    if (sendNoteBtn) sendNoteBtn.disabled = disabled;
+    if (skipNoteBtn) skipNoteBtn.disabled = disabled;
+    if (cancelNoteBtn) cancelNoteBtn.disabled = disabled;
+    if (noteInput) noteInput.disabled = disabled;
+  };
 
   const markSubmitted = (label) => {
-    bar.innerHTML = `<span class="feedback-saved">${label}</span>`;
+    if (bar) {
+      bar.innerHTML = `<span class="feedback-saved">${escapeHtml(label)}</span>`;
+    }
     if (noteWrap) {
       noteWrap.classList.add('hidden');
     }
@@ -208,14 +221,12 @@ function wireFeedback(card, message) {
   };
 
   upBtn?.addEventListener('click', async () => {
-    upBtn.disabled = true;
-    if (downBtn) downBtn.disabled = true;
+    setButtonsDisabled(true);
     try {
       await submitFeedback(message, true, '');
       markSubmitted('Saved feedback: helpful');
     } catch (error) {
-      upBtn.disabled = false;
-      if (downBtn) downBtn.disabled = false;
+      setButtonsDisabled(false);
       alert(`Feedback failed: ${error.message}`);
     }
   });
@@ -224,22 +235,36 @@ function wireFeedback(card, message) {
     if (noteWrap) {
       noteWrap.classList.remove('hidden');
     }
-  });
-
-  noteBtn?.addEventListener('click', () => {
-    if (noteWrap) {
-      noteWrap.classList.toggle('hidden');
+    if (noteInput) {
+      noteInput.focus();
     }
   });
 
-  noteSubmit?.addEventListener('click', async () => {
-    noteSubmit.disabled = true;
+  sendNoteBtn?.addEventListener('click', async () => {
+    setButtonsDisabled(true);
     try {
       await submitFeedback(message, false, noteInput?.value || '');
       markSubmitted('Saved feedback: not helpful');
     } catch (error) {
-      noteSubmit.disabled = false;
+      setButtonsDisabled(false);
       alert(`Feedback failed: ${error.message}`);
+    }
+  });
+
+  skipNoteBtn?.addEventListener('click', async () => {
+    setButtonsDisabled(true);
+    try {
+      await submitFeedback(message, false, '');
+      markSubmitted('Saved feedback: not helpful');
+    } catch (error) {
+      setButtonsDisabled(false);
+      alert(`Feedback failed: ${error.message}`);
+    }
+  });
+
+  cancelNoteBtn?.addEventListener('click', () => {
+    if (noteWrap) {
+      noteWrap.classList.add('hidden');
     }
   });
 }
@@ -337,6 +362,11 @@ function detectRepoPathFromPrompt(text) {
   return match ? match[1].trim() : null;
 }
 
+function isFullFileRewritePrompt(text) {
+  const lower = String(text ?? '').toLowerCase();
+  return /full source code fix|full rewrite|complete replacement|return the full file|provide the full file|rewrite this file|provide a version of this file|full file rewrite|replacement file|version of this file/.test(lower);
+}
+
 function responseToDisplay(response) {
   const textParts = [];
   for (const block of response.content || []) {
@@ -359,11 +389,13 @@ function buildRequestPayload(userText) {
 
   transcript.push({ role: 'user', content: [{ type: 'text', text: userText }] });
 
+  const maxTokens = isFullFileRewritePrompt(userText) ? 12000 : 2048;
+
   return {
     model: 'local',
-    max_tokens: 2048,
+    max_tokens: maxTokens,
     system:
-      'You are Claw, an offline coding assistant. Prefer clear, readable markdown with fenced code blocks. Keep code copy-friendly and well explained. When the user asks to analyze a file, directory, crate, workspace, or source tree, analyze the actual provided local source context and filesystem structure if present. Do not answer with generic shell instructions when local source context has been supplied.',
+      'You are Claw, an offline coding assistant. Prefer clear, readable markdown with fenced code blocks. Keep code copy-friendly and well explained. When the user asks to analyze a file, directory, crate, workspace, or source tree, analyze the actual provided local source context and filesystem structure if present. When the user requests a full file rewrite or complete replacement, prefer returning the complete replacement file without unnecessary preamble.',
     messages: transcript,
     stream: false,
   };
