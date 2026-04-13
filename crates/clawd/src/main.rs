@@ -41,6 +41,11 @@ const FILE_REWRITE_MAX_TOKENS: u32 = 20_000;
 const FILE_REWRITE_CONTINUATION_MAX_TOKENS: u32 = 8_000;
 const MAX_FILE_REWRITE_CONTINUATIONS: usize = 3;
 
+const MAX_HISTORY_MESSAGES_BEFORE_COMPACTION: usize = 12;
+const KEEP_RECENT_MESSAGES: usize = 8;
+const MAX_SUMMARY_CHARS: usize = 6_000;
+const MAX_MESSAGE_TEXT_CHARS: usize = 2_000;
+
 #[derive(Clone)]
 struct AppState {
     http: Client,
@@ -751,6 +756,8 @@ async fn process_message_request(
     request: &MessageRequest,
 ) -> Result<MessageResponse, Box<dyn std::error::Error + Send + Sync>> {
     let mut runner_request = maybe_enrich_request_with_local_sources(request);
+    runner_request = compact_request_history(&runner_request);
+
     let require_tool_use = request_has_local_path(request);
     let wants_repo_analysis = request_needs_repo_analysis(request);
     let wants_file_fix = request_needs_file_fix(request);
@@ -875,6 +882,101 @@ async fn process_message_request(
     .into())
 }
 
+fn compact_request_history(request: &MessageRequest) -> MessageRequest {
+    if request.messages.len() <= MAX_HISTORY_MESSAGES_BEFORE_COMPACTION {
+        return request.clone();
+    }
+
+    let mut compacted = request.clone();
+    let split_at = request.messages.len().saturating_sub(KEEP_RECENT_MESSAGES);
+    let older = &request.messages[..split_at];
+    let recent = &request.messages[split_at..];
+
+    let summary = summarize_messages_for_context(older);
+    compacted.messages = Vec::new();
+
+    if !summary.is_empty() {
+        compacted.messages.push(InputMessage {
+            role: "system".to_string(),
+            content: vec![InputContentBlock::Text {
+                text: format!("Conversation summary of earlier messages:\n{summary}"),
+            }],
+        });
+    }
+
+    compacted.messages.extend(recent.iter().cloned());
+    compacted
+}
+
+fn summarize_messages_for_context(messages: &[InputMessage]) -> String {
+    let mut out = String::new();
+    let mut used = 0usize;
+
+    for (idx, message) in messages.iter().enumerate() {
+        let role = if message.role.eq_ignore_ascii_case("user") {
+            "User"
+        } else if message.role.eq_ignore_ascii_case("assistant") {
+            "Assistant"
+        } else {
+            "Message"
+        };
+
+        let text = message_text_summary(message);
+        if text.is_empty() {
+            continue;
+        }
+
+        let entry = format!("{}. {}: {}\n", idx + 1, role, text);
+        if used + entry.len() > MAX_SUMMARY_CHARS {
+            break;
+        }
+
+        used += entry.len();
+        out.push_str(&entry);
+    }
+
+    out
+}
+
+fn message_text_summary(message: &InputMessage) -> String {
+    let mut text = String::new();
+
+    for block in &message.content {
+        match block {
+            InputContentBlock::Text { text: block_text } => {
+                if !text.is_empty() {
+                    text.push(' ');
+                }
+                text.push_str(block_text);
+            }
+            InputContentBlock::ToolUse { name, .. } => {
+                if !text.is_empty() {
+                    text.push(' ');
+                }
+                text.push_str(&format!("[tool_use:{name}]"));
+            }
+            _ => {}
+        }
+    }
+
+    let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let truncated = truncate_string_chars(&compact, MAX_MESSAGE_TEXT_CHARS);
+    truncated.trim().to_string()
+}
+
+fn truncate_string_chars(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+
+    let mut out = String::new();
+    for ch in text.chars().take(max_chars) {
+        out.push(ch);
+    }
+    out.push('…');
+    out
+}
+
 async fn run_single_file_rewrite(
     state: &AppState,
     request: &MessageRequest,
@@ -980,6 +1082,7 @@ async fn continue_file_rewrite(
     )
     .into())
 }
+
 fn replace_response_content(
     mut response: MessageResponse,
     lang: &str,
@@ -990,6 +1093,7 @@ fn replace_response_content(
     }];
     response
 }
+
 fn looks_rewrite_complete(code: &str, source: &str) -> bool {
     let src_lines = source.lines().count();
     let out_lines = code.lines().count();
