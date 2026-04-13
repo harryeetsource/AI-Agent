@@ -10,9 +10,13 @@ const activityEl = document.getElementById('activity');
 const messageTemplate = document.getElementById('message-template');
 const wrapCodeCheckbox = document.getElementById('wrap-code');
 
+const MAX_RECENT_MESSAGES = 10;
+const SUMMARY_TRIGGER_MESSAGES = 14;
+
 const state = {
   messages: [],
   wrapCode: true,
+  conversationSummary: '',
 };
 
 function formatClockTimestamp(date = new Date()) {
@@ -232,12 +236,8 @@ function wireFeedback(card, message) {
   });
 
   downBtn?.addEventListener('click', () => {
-    if (noteWrap) {
-      noteWrap.classList.remove('hidden');
-    }
-    if (noteInput) {
-      noteInput.focus();
-    }
+    if (noteWrap) noteWrap.classList.remove('hidden');
+    if (noteInput) noteInput.focus();
   });
 
   sendNoteBtn?.addEventListener('click', async () => {
@@ -263,9 +263,7 @@ function wireFeedback(card, message) {
   });
 
   cancelNoteBtn?.addEventListener('click', () => {
-    if (noteWrap) {
-      noteWrap.classList.add('hidden');
-    }
+    if (noteWrap) noteWrap.classList.add('hidden');
   });
 }
 
@@ -364,7 +362,11 @@ function detectRepoPathFromPrompt(text) {
 
 function isFullFileRewritePrompt(text) {
   const lower = String(text ?? '').toLowerCase();
-  return /full source code fix|full rewrite|complete replacement|return the full file|provide the full file|rewrite this file|provide a version of this file|full file rewrite|replacement file|version of this file/.test(lower);
+  const hasFilePath = /([a-z]:\\[^\n]+|\/[^\n]+\.[a-z0-9_]+)/i.test(lower);
+  const rewriteIntent =
+    /full source code fix|full rewrite|complete replacement|return the full file|provide the full file|rewrite this file|provide a version of this file|full file rewrite|replacement file|version of this file|modify this file|update this file|correct this file|repair this file/.test(lower);
+
+  return hasFilePath && rewriteIntent;
 }
 
 function responseToDisplay(response) {
@@ -381,11 +383,61 @@ function responseToDisplay(response) {
   return textParts.join('\n\n').trim();
 }
 
+function summarizeOlderMessages(messages) {
+  if (!messages.length) return '';
+
+  const recent = messages.slice(-8);
+  const lines = recent.map((msg, idx) => {
+    const label = msg.role === 'user' ? 'User' : 'Assistant';
+    const text = String(msg.text ?? '').replace(/\s+/g, ' ').trim();
+    const compact = text.length > 220 ? `${text.slice(0, 220)}…` : text;
+    return `${idx + 1}. ${label}: ${compact}`;
+  });
+
+  return [
+    'Earlier conversation summary:',
+    ...lines,
+  ].join('\n');
+}
+
+function maybeRefreshConversationSummary() {
+  if (state.messages.length < SUMMARY_TRIGGER_MESSAGES) {
+    return;
+  }
+
+  const older = state.messages.slice(0, Math.max(0, state.messages.length - MAX_RECENT_MESSAGES));
+  if (!older.length) {
+    return;
+  }
+
+  const summary = summarizeOlderMessages(older);
+  if (summary) {
+    state.conversationSummary = summary;
+  }
+}
+
 function buildRequestPayload(userText) {
-  const transcript = state.messages.map((item) => ({
-    role: item.role,
-    content: [{ type: 'text', text: item.text }],
-  }));
+  maybeRefreshConversationSummary();
+
+  const recentMessages = state.messages.slice(-MAX_RECENT_MESSAGES);
+  const transcript = [];
+
+  if (state.conversationSummary) {
+    transcript.push({
+      role: 'system',
+      content: [{
+        type: 'text',
+        text: state.conversationSummary,
+      }],
+    });
+  }
+
+  for (const item of recentMessages) {
+    transcript.push({
+      role: item.role,
+      content: [{ type: 'text', text: item.text }],
+    });
+  }
 
   transcript.push({ role: 'user', content: [{ type: 'text', text: userText }] });
 
@@ -532,6 +584,7 @@ promptEl.addEventListener('keydown', (event) => {
 
 clearChatButton.addEventListener('click', () => {
   state.messages.length = 0;
+  state.conversationSummary = '';
   messagesEl.innerHTML = '';
   setActivity('');
   promptEl.focus();
