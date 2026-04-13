@@ -30,9 +30,9 @@ const DEFAULT_RUNNER_BASE_URL: &str = "http://127.0.0.1:8081";
 const DEFAULT_RUNNER_MESSAGES_PATH: &str = "/v1/messages";
 const DEFAULT_DB_PATH: &str = "data/knowledge.db";
 
-const MAX_FALLBACK_FILES: usize = 5;
-const MAX_FALLBACK_FILE_CHARS: usize = 2500;
-const MAX_FALLBACK_TOTAL_CHARS: usize = 9000;
+const MAX_FALLBACK_FILES: usize = 12;
+const MAX_FALLBACK_FILE_CHARS: usize = 10_000;
+const MAX_FALLBACK_TOTAL_CHARS: usize = 24_000;
 const MAX_TOOL_ROUNDS: usize = 1;
 const MAX_SUMMARY_FILES: usize = 12;
 const MAX_TOOL_OUTPUT_CHARS: usize = 4000;
