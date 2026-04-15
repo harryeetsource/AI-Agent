@@ -90,6 +90,11 @@ enum RewriteAssessment {
     Malformed(String),
 }
 
+enum CodeValidation {
+    Accept,
+    Reject(String),
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
@@ -491,6 +496,48 @@ fn request_needs_file_fix(request: &MessageRequest) -> bool {
         .any(|term| lower.contains(term))
 }
 
+fn request_expects_code_response(request: &MessageRequest) -> bool {
+    let Some(text) = latest_user_text(request) else {
+        return false;
+    };
+
+    let lower = text.to_ascii_lowercase();
+
+    if request_needs_file_fix(request) {
+        return true;
+    }
+
+    let code_terms = [
+        "implement",
+        "implementation",
+        "write the code",
+        "give me the code",
+        "provide code",
+        "source code",
+        "full source",
+        "return code",
+        "rust code",
+        "fix this function",
+        "fix this file",
+        "patch this",
+        "rewrite this",
+        "complete this",
+        "build a module",
+        "create a module",
+        "add a module",
+        "new module",
+        "write a module",
+    ];
+
+    let has_code_term = code_terms.iter().any(|term| lower.contains(term));
+    let mentions_file_path = detect_existing_path(&text)
+        .as_deref()
+        .map(|p| p.is_file() || p.is_dir())
+        .unwrap_or(false);
+
+    has_code_term || mentions_file_path
+}
+
 fn build_repo_fallback_context(request: &MessageRequest) -> Option<String> {
     let user_text = latest_user_text(request)?;
     let target_path = detect_existing_path(&user_text)?;
@@ -761,6 +808,7 @@ async fn process_message_request(
     let require_tool_use = request_has_local_path(request);
     let wants_repo_analysis = request_needs_repo_analysis(request);
     let wants_file_fix = request_needs_file_fix(request);
+    let expects_code = request_expects_code_response(request);
     let detected_path = latest_user_text(request).and_then(|text| detect_existing_path(&text));
     let mut saw_real_tool_use = false;
 
@@ -790,6 +838,15 @@ async fn process_message_request(
 
         if tool_uses.is_empty() {
             let fake_plan = looks_like_fake_tool_plan(&response);
+
+            if expects_code {
+                match validate_code_response(&response) {
+                    CodeValidation::Accept => {}
+                    CodeValidation::Reject(reason) => {
+                        return Err(std::io::Error::other(reason).into());
+                    }
+                }
+            }
 
             if require_tool_use && !saw_real_tool_use {
                 if wants_repo_analysis {
@@ -1138,6 +1195,390 @@ fn extract_single_fenced_code_block(text: &str) -> Option<String> {
     }
 
     Some(inner.trim_end_matches('\n').to_string())
+}
+
+fn validate_code_response(response: &MessageResponse) -> CodeValidation {
+    let combined = collect_text_blocks(response);
+
+    if combined.trim().is_empty() {
+        return CodeValidation::Reject(build_code_validation_error(
+            "code response was empty",
+            response,
+        ));
+    }
+
+    if !combined.contains("```") {
+        return CodeValidation::Reject(build_code_validation_error(
+            "code was requested but the response did not contain a fenced code block",
+            response,
+        ));
+    }
+
+    let code_blocks = extract_all_fenced_code_blocks(&combined);
+    if code_blocks.is_empty() {
+        return CodeValidation::Reject(build_code_validation_error(
+            "code was requested but no valid fenced code block could be extracted",
+            response,
+        ));
+    }
+
+    for block in &code_blocks {
+        let lower = block.to_ascii_lowercase();
+
+        let placeholder_markers = [
+            "todo",
+            "placeholder",
+            "logic goes here",
+            "implementation goes here",
+            "your logic here",
+            "fill this in",
+            "for demonstration purposes",
+            "example implementation",
+            "demo implementation",
+            "mock implementation",
+            "stub implementation",
+            "actual address resolution logic",
+            "implement resolver stub generation logic",
+            "implement logic here",
+            "this is a placeholder",
+            "replace this with",
+            "omitted for brevity",
+            "left as an exercise",
+            "not implemented",
+            "unimplemented!",
+            "todo!",
+            "0x12345678",
+        ];
+
+        if let Some(marker) = placeholder_markers.iter().find(|m| lower.contains(**m)) {
+            return CodeValidation::Reject(build_code_validation_error(
+                &format!("code response contained placeholder or speculative logic: `{}`", marker),
+                response,
+            ));
+        }
+
+        if has_suspicious_placeholder_comments(block) {
+            return CodeValidation::Reject(build_code_validation_error(
+                "code response contained comment-based placeholder scaffolding",
+                response,
+            ));
+        }
+
+        if has_unimplemented_macros(block) {
+            return CodeValidation::Reject(build_code_validation_error(
+                "code response contained explicit unimplemented/todo macros",
+                response,
+            ));
+        }
+
+        if has_obviously_empty_fn_bodies(block) {
+            return CodeValidation::Reject(build_code_validation_error(
+                "code response contained function bodies that appear incomplete or empty",
+                response,
+            ));
+        }
+
+        if has_fake_success_paths(block) {
+            return CodeValidation::Reject(build_code_validation_error(
+                "code response appears to use fake success paths instead of real implementation",
+                response,
+            ));
+        }
+
+        if !has_balanced_rust_delimiters(block) {
+            return CodeValidation::Reject(build_code_validation_error(
+                "code response appears structurally incomplete due to unbalanced delimiters",
+                response,
+            ));
+        }
+    }
+
+    CodeValidation::Accept
+}
+
+fn build_code_validation_error(reason: &str, response: &MessageResponse) -> String {
+    let raw = collect_text_blocks(response);
+    let raw_trimmed = truncate_string_chars(raw.trim(), 2_500);
+
+    if raw_trimmed.is_empty() {
+        format!("{reason}\n\nModel response was empty.")
+    } else {
+        format!("{reason}\n\nModel response:\n{}", raw_trimmed)
+    }
+}
+
+fn extract_all_fenced_code_blocks(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = text;
+
+    while let Some(start) = rest.find("```") {
+        let after_ticks = &rest[start + 3..];
+        let Some(first_newline) = after_ticks.find('\n') else {
+            break;
+        };
+
+        let after_lang = &after_ticks[first_newline + 1..];
+        let Some(end) = after_lang.find("```") else {
+            break;
+        };
+
+        let code = &after_lang[..end];
+        out.push(code.trim_end_matches('\n').to_string());
+
+        rest = &after_lang[end + 3..];
+    }
+
+    out
+}
+
+fn has_suspicious_placeholder_comments(code: &str) -> bool {
+    code.lines().any(|line| {
+        let trimmed = line.trim().to_ascii_lowercase();
+
+        (trimmed.starts_with("//") || trimmed.starts_with("/*") || trimmed.starts_with('*'))
+            && (trimmed.contains("logic goes here")
+                || trimmed.contains("implementation goes here")
+                || trimmed.contains("replace with real logic")
+                || trimmed.contains("placeholder")
+                || trimmed.contains("example only")
+                || trimmed.contains("demo only")
+                || trimmed.contains("actual logic omitted")
+                || trimmed.contains("actual implementation omitted"))
+    })
+}
+
+fn has_unimplemented_macros(code: &str) -> bool {
+    let lower = code.to_ascii_lowercase();
+    lower.contains("todo!()")
+        || lower.contains("todo!(")
+        || lower.contains("unimplemented!()")
+        || lower.contains("unimplemented!(")
+}
+
+fn has_fake_success_paths(code: &str) -> bool {
+    let lower = code.to_ascii_lowercase();
+
+    (lower.contains("return ok(())")
+        || lower.contains("ok(())")
+        || lower.contains("return some(default::default())")
+        || lower.contains("return default::default()"))
+        && (lower.contains("placeholder")
+            || lower.contains("todo")
+            || lower.contains("implement")
+            || lower.contains("stub")
+            || lower.contains("example"))
+}
+
+fn has_obviously_empty_fn_bodies(code: &str) -> bool {
+    let bytes = code.as_bytes();
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        if bytes[i..].starts_with(b"fn ")
+            || bytes[i..].starts_with(b"pub fn ")
+            || bytes[i..].starts_with(b"async fn ")
+            || bytes[i..].starts_with(b"pub async fn ")
+        {
+            let Some(open_rel) = code[i..].find('{') else {
+                return true;
+            };
+            let open_idx = i + open_rel;
+            let Some(close_idx) = find_matching_brace(code, open_idx) else {
+                return true;
+            };
+
+            let body = code[open_idx + 1..close_idx].trim();
+            let body_lower = body.to_ascii_lowercase();
+
+            if body.is_empty() {
+                return true;
+            }
+
+            let comment_only = body.lines().all(|line| {
+                let t = line.trim();
+                t.is_empty() || t.starts_with("//") || t.starts_with("/*") || t.starts_with('*')
+            });
+
+            if comment_only {
+                return true;
+            }
+
+            if body_lower == "todo!()"
+                || body_lower == "unimplemented!()"
+                || body_lower == "panic!()"
+                || body_lower == "panic!(\"todo\")"
+                || body_lower == "panic!(\"unimplemented\")"
+            {
+                return true;
+            }
+
+            i = close_idx + 1;
+            continue;
+        }
+
+        i += 1;
+    }
+
+    false
+}
+
+fn has_balanced_rust_delimiters(code: &str) -> bool {
+    let mut braces = 0i32;
+    let mut parens = 0i32;
+    let mut brackets = 0i32;
+
+    let mut chars = code.chars().peekable();
+    let mut in_string = false;
+    let mut in_char = false;
+    let mut escape = false;
+
+    while let Some(ch) = chars.next() {
+        if in_string {
+            if escape {
+                escape = false;
+                continue;
+            }
+            match ch {
+                '\\' => escape = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+
+        if in_char {
+            if escape {
+                escape = false;
+                continue;
+            }
+            match ch {
+                '\\' => escape = true,
+                '\'' => in_char = false,
+                _ => {}
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_string = true,
+            '\'' => in_char = true,
+            '{' => braces += 1,
+            '}' => braces -= 1,
+            '(' => parens += 1,
+            ')' => parens -= 1,
+            '[' => brackets += 1,
+            ']' => brackets -= 1,
+            '/' => {
+                if let Some('/') = chars.peek().copied() {
+                    for c in chars.by_ref() {
+                        if c == '\n' {
+                            break;
+                        }
+                    }
+                } else if let Some('*') = chars.peek().copied() {
+                    chars.next();
+                    let mut prev = '\0';
+                    for c in chars.by_ref() {
+                        if prev == '*' && c == '/' {
+                            break;
+                        }
+                        prev = c;
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        if braces < 0 || parens < 0 || brackets < 0 {
+            return false;
+        }
+    }
+
+    !in_string && !in_char && braces == 0 && parens == 0 && brackets == 0
+}
+
+fn find_matching_brace(code: &str, open_idx: usize) -> Option<usize> {
+    let bytes = code.as_bytes();
+    if bytes.get(open_idx).copied()? != b'{' {
+        return None;
+    }
+
+    let mut depth = 0i32;
+    let mut i = open_idx;
+    let mut in_string = false;
+    let mut in_char = false;
+    let mut escape = false;
+
+    while i < bytes.len() {
+        let ch = bytes[i] as char;
+
+        if in_string {
+            if escape {
+                escape = false;
+                i += 1;
+                continue;
+            }
+            match ch {
+                '\\' => escape = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            i += 1;
+            continue;
+        }
+
+        if in_char {
+            if escape {
+                escape = false;
+                i += 1;
+                continue;
+            }
+            match ch {
+                '\\' => escape = true,
+                '\'' => in_char = false,
+                _ => {}
+            }
+            i += 1;
+            continue;
+        }
+
+        match ch {
+            '"' => in_string = true,
+            '\'' => in_char = true,
+            '/' if i + 1 < bytes.len() && bytes[i + 1] == b'/' => {
+                i += 2;
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            '/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
+                i += 2;
+                while i + 1 < bytes.len() {
+                    if bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                        i += 2;
+                        break;
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+            '{' => {
+                depth += 1;
+            }
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+
+        i += 1;
+    }
+
+    None
 }
 
 fn stitch_code_continuation(existing: &str, next_chunk: &str) -> String {
